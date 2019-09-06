@@ -34,15 +34,17 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ///
 /////////////////////////////////////////////////////////////////////////
 
+#include "oslexec_pvt.h"
+#include <OSL/dual.h>
+#include <OSL/dual_vec.h>
+#include <OSL/device_string.h>
+
 #include <OpenImageIO/fmath.h>
 #include <OpenImageIO/simd.h>
 
 #include <iostream>
 #include <cmath>
 
-#include "oslexec_pvt.h"
-#include "OSL/dual.h"
-#include "OSL/dual_vec.h"
 
 
 OSL_NAMESPACE_ENTER
@@ -52,19 +54,19 @@ namespace pvt {
 
 // Matrix ops
 
-OSL_SHADEOP void
+OSL_SHADEOP OSL_HOSTDEVICE void
 osl_mul_mm (void *r, void *a, void *b)
 {
     MAT(r) = MAT(a) * MAT(b);
 }
 
-OSL_SHADEOP void
+OSL_SHADEOP OSL_HOSTDEVICE void
 osl_mul_mf (void *r, void *a, float b)
 {
     MAT(r) = MAT(a) * b;
 }
 
-OSL_SHADEOP void
+OSL_SHADEOP OSL_HOSTDEVICE void
 osl_mul_m_ff (void *r, float a, float b)
 {
     float f = a * b;
@@ -73,25 +75,25 @@ osl_mul_m_ff (void *r, float a, float b)
 
 
 
-OSL_SHADEOP void
+OSL_SHADEOP OSL_HOSTDEVICE void
 osl_div_mm (void *r, void *a, void *b)
 {
     MAT(r) = MAT(a) * MAT(b).inverse();
 }
 
-OSL_SHADEOP void
+OSL_SHADEOP OSL_HOSTDEVICE void
 osl_div_mf (void *r, void *a, float b)
 {
     MAT(r) = MAT(a) * (1.0f/b);
 }
 
-OSL_SHADEOP void
+OSL_SHADEOP OSL_HOSTDEVICE void
 osl_div_fm (void *r, float a, void *b)
 {
     MAT(r) = a * MAT(b).inverse();
 }
 
-OSL_SHADEOP void
+OSL_SHADEOP OSL_HOSTDEVICE void
 osl_div_m_ff (void *r, float a, float b)
 {
     float f = (b == 0) ? 0.0f : (a / b);
@@ -100,14 +102,60 @@ osl_div_m_ff (void *r, float a, float b)
 
 
 
-OSL_SHADEOP void
+OSL_SHADEOP OSL_HOSTDEVICE void
 osl_transpose_mm (void *r, void *m)
 {
     MAT(r) = MAT(m).transposed();
 }
 
 
+// point = M * point
+OSL_SHADEOP OSL_HOSTDEVICE void osl_transform_vmv(void *result, void* M_, void* v_)
+{
+   const Vec3 &v = VEC(v_);
+   const Matrix44 &M = MAT(M_);
+   robust_multVecMatrix (M, v, VEC(result));
+}
 
+OSL_SHADEOP OSL_HOSTDEVICE void osl_transform_dvmdv(void *result, void* M_, void* v_)
+{
+   const Dual2<Vec3> &v = DVEC(v_);
+   const Matrix44    &M = MAT(M_);
+   robust_multVecMatrix (M, v, DVEC(result));
+}
+
+// vector = M * vector
+OSL_SHADEOP OSL_HOSTDEVICE void osl_transformv_vmv(void *result, void* M_, void* v_)
+{
+   const Vec3 &v = VEC(v_);
+   const Matrix44 &M = MAT(M_);
+   M.multDirMatrix (v, VEC(result));
+}
+
+OSL_SHADEOP OSL_HOSTDEVICE void osl_transformv_dvmdv(void *result, void* M_, void* v_)
+{
+   const Dual2<Vec3> &v = DVEC(v_);
+   const Matrix44    &M = MAT(M_);
+   multDirMatrix (M, v, DVEC(result));
+}
+
+
+// normal = M * normal
+OSL_SHADEOP OSL_HOSTDEVICE void osl_transformn_vmv(void *result, void* M_, void* v_)
+{
+   const Vec3 &v = VEC(v_);
+   const Matrix44 &M = MAT(M_);
+   M.inverse().transposed().multDirMatrix (v, VEC(result));
+}
+
+OSL_SHADEOP OSL_HOSTDEVICE void osl_transformn_dvmdv(void *result, void* M_, void* v_)
+{
+   const Dual2<Vec3> &v = DVEC(v_);
+   const Matrix44    &M = MAT(M_);
+   multDirMatrix (M.inverse().transposed(), v, DVEC(result));
+}
+
+#ifndef __CUDACC__
 OSL_SHADEOP int
 osl_get_matrix (void *sg_, void *r, const char *from)
 {
@@ -165,27 +213,37 @@ osl_get_inverse_matrix (void *sg_, void *r, const char *to)
     }
     return ok;
 }
+#else
+// Implemented by the renderer
+#define OSL_SHADEOP_EXPORT extern "C" OSL_DLL_EXPORT
+OSL_SHADEOP_EXPORT OSL_HOSTDEVICE int osl_get_matrix (void *sg_, void *r, const char *from);
+OSL_SHADEOP_EXPORT OSL_HOSTDEVICE int osl_get_inverse_matrix (void *sg_, void *r, const char *to);
+#undef OSL_SHADEOP_EXPORT
+#endif // __CUDACC__
 
 
 
-OSL_SHADEOP int
+OSL_SHADEOP OSL_HOSTDEVICE int
 osl_prepend_matrix_from (void *sg, void *r, const char *from)
 {
     Matrix44 m;
     bool ok = osl_get_matrix ((ShaderGlobals *)sg, &m, from);
     if (ok)
         MAT(r) = m * MAT(r);
+#ifndef __CUDACC__
+    // TODO: How do we manage this in OptiX?
     else {
         ShadingContext *ctx = (ShadingContext *)((ShaderGlobals *)sg)->context;
         if (ctx->shadingsys().unknown_coordsys_error())
             ctx->error ("Unknown transformation \"%s\"", from);
     }
+#endif
     return ok;
 }
 
 
 
-OSL_SHADEOP int
+OSL_SHADEOP OSL_HOSTDEVICE int
 osl_get_from_to_matrix (void *sg, void *r, const char *from, const char *to)
 {
     Matrix44 Mfrom, Mto;
@@ -197,60 +255,18 @@ osl_get_from_to_matrix (void *sg, void *r, const char *from, const char *to)
 
 
 
-// point = M * point
-inline void osl_transform_vmv(void *result, const Matrix44 &M, void* v_)
-{
-   const Vec3 &v = VEC(v_);
-   robust_multVecMatrix (M, v, VEC(result));
-}
-
-inline void osl_transform_dvmdv(void *result, const Matrix44 &M, void* v_)
-{
-   const Dual2<Vec3> &v = DVEC(v_);
-   robust_multVecMatrix (M, v, DVEC(result));
-}
-
-// vector = M * vector
-inline void osl_transformv_vmv(void *result, const Matrix44 &M, void* v_)
-{
-   const Vec3 &v = VEC(v_);
-   M.multDirMatrix (v, VEC(result));
-}
-
-inline void osl_transformv_dvmdv(void *result, const Matrix44 &M, void* v_)
-{
-   const Dual2<Vec3> &v = DVEC(v_);
-   multDirMatrix (M, v, DVEC(result));
-}
-
-// normal = M * normal
-inline void osl_transformn_vmv(void *result, const Matrix44 &M, void* v_)
-{
-   const Vec3 &v = VEC(v_);
-   M.inverse().transposed().multDirMatrix (v, VEC(result));
-}
-
-inline void osl_transformn_dvmdv(void *result, const Matrix44 &M, void* v_)
-{
-   const Dual2<Vec3> &v = DVEC(v_);
-   multDirMatrix (M.inverse().transposed(), v, DVEC(result));
-}
-
-
-
-OSL_SHADEOP int
+OSL_SHADEOP OSL_HOSTDEVICE int
 osl_transform_triple (void *sg_, void *Pin, int Pin_derivs,
                       void *Pout, int Pout_derivs,
                       void *from, void *to, int vectype)
 {
-    static ustring u_common ("common");
     ShaderGlobals *sg = (ShaderGlobals *)sg_;
     Matrix44 M;
     int ok;
     Pin_derivs &= Pout_derivs;   // ignore derivs if output doesn't need it
-    if (USTR(from) == u_common)
+    if (HDSTR(from) == StringParams::common)
         ok = osl_get_inverse_matrix (sg, &M, (const char *)to);
-    else if (USTR(to) == u_common)
+    else if (HDSTR(to) == StringParams::common)
         ok = osl_get_matrix (sg, &M, (const char *)from);
     else
         ok = osl_get_from_to_matrix (sg, &M, (const char *)from,
@@ -258,21 +274,26 @@ osl_transform_triple (void *sg_, void *Pin, int Pin_derivs,
     if (ok) {
         if (vectype == TypeDesc::POINT) {
             if (Pin_derivs)
-                osl_transform_dvmdv(Pout, M, Pin);
+                osl_transform_dvmdv(Pout, &M, Pin);
             else
-                osl_transform_vmv(Pout, M, Pin);
+                osl_transform_vmv(Pout, &M, Pin);
         } else if (vectype == TypeDesc::VECTOR) {
             if (Pin_derivs)
-                osl_transformv_dvmdv(Pout, M, Pin);
+                osl_transformv_dvmdv(Pout, &M, Pin);
             else
-                osl_transformv_vmv(Pout, M, Pin);
+                osl_transformv_vmv(Pout, &M, Pin);
         } else if (vectype == TypeDesc::NORMAL) {
             if (Pin_derivs)
-                osl_transformn_dvmdv(Pout, M, Pin);
+                osl_transformn_dvmdv(Pout, &M, Pin);
             else
-                osl_transformn_vmv(Pout, M, Pin);
+                osl_transformn_vmv(Pout, &M, Pin);
         }
+#ifndef __CUDACC__
         else ASSERT(0);
+#else
+        // TBR: Is the ok?
+        else ok = false;
+#endif
     } else {
         *(Vec3 *)Pout = *(Vec3 *)Pin;
         if (Pin_derivs) {
@@ -289,13 +310,14 @@ osl_transform_triple (void *sg_, void *Pin, int Pin_derivs,
 
 
 
-OSL_SHADEOP int
+OSL_SHADEOP OSL_HOSTDEVICE int
 osl_transform_triple_nonlinear (void *sg_, void *Pin, int Pin_derivs,
                                 void *Pout, int Pout_derivs,
                                 void *from, void *to,
                                 int vectype)
 {
     ShaderGlobals *sg = (ShaderGlobals *)sg_;
+#ifndef __CUDACC__
     RendererServices *rend = sg->renderer;
     if (rend->transform_points (sg, USTR(from), USTR(to), sg->time,
                                 (const Vec3 *)Pin, (Vec3 *)Pout, 1,
@@ -314,17 +336,19 @@ osl_transform_triple_nonlinear (void *sg_, void *Pin, int Pin_derivs,
         }
         return true;
     }
+#endif // __CUDACC__
 
     // Renderer couldn't or wouldn't transform directly
+    // Except in OptiX we're the renderer will directly implement
+    // the transform in osl_transform_triple.
     return osl_transform_triple (sg, Pin, Pin_derivs, Pout, Pout_derivs,
                                  from, to, vectype);
 }
 
 
-
 // Calculate the determinant of a 2x2 matrix.
 template <typename F>
-inline F det2x2(F a, F b, F c, F d)
+OSL_HOSTDEVICE inline F det2x2(F a, F b, F c, F d)
 {
     return a * d - b * c;
 }
@@ -334,7 +358,7 @@ inline F det2x2(F a, F b, F c, F d)
 //     | a2,  b2,  c2 |
 //     | a3,  b3,  c3 |
 template <typename F>
-inline F det3x3(F a1, F a2, F a3, F b1, F b2, F b3, F c1, F c2, F c3)
+OSL_HOSTDEVICE inline F det3x3(F a1, F a2, F a3, F b1, F b2, F b3, F c1, F c2, F c3)
 {
     return a1 * det2x2( b2, b3, c2, c3 )
          - b1 * det2x2( a2, a3, c2, c3 )
@@ -343,7 +367,7 @@ inline F det3x3(F a1, F a2, F a3, F b1, F b2, F b3, F c1, F c2, F c3)
 
 // calculate the determinant of a 4x4 matrix.
 template <typename F>
-inline F det4x4(const Imath::Matrix44<F> &m)
+OSL_HOSTDEVICE inline F det4x4(const Imath::Matrix44<F> &m)
 {
     // assign to individual variable names to aid selecting correct elements
     F a1 = m[0][0], b1 = m[0][1], c1 = m[0][2], d1 = m[0][3];
@@ -356,7 +380,7 @@ inline F det4x4(const Imath::Matrix44<F> &m)
          - d1 * det3x3( a2, a3, a4, b2, b3, b4, c2, c3, c4);
 }
 
-OSL_SHADEOP float
+OSL_SHADEOP OSL_HOSTDEVICE float
 osl_determinant_fm (void *m)
 {
     return det4x4 (MAT(m));

@@ -30,12 +30,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <cmath>
 #include <cstdlib>
 
-#include <boost/regex.hpp>
-
 #include <OpenImageIO/fmath.h>
 #include <OpenImageIO/sysutil.h>
 
 #include "oslexec_pvt.h"
+#include "opcolor.h"
 #include "runtimeoptimize.h"
 #include <OSL/dual.h>
 #include <OSL/oslnoise.h>
@@ -56,7 +55,11 @@ static ustring u_nop    ("nop"),
                u_inversesqrt ("inversesqrt"),
                u_if     ("if"),
                u_eq     ("eq"),
-               u_return ("return");
+               u_return ("return"),
+               u_error  ("error"),
+               u_fmterror("%s"),
+               u_fmt_range_check("Index [%d] out of range %s[0..%d]: %s:%d (group %s, layer %d %s, shader %s)");
+
 static ustring u_cell ("cell"), u_cellnoise ("cellnoise");
 
 
@@ -299,6 +302,35 @@ DECLFOLDER(constfold_div)
             rop.turn_into_assign (op, cind, "const / const");
             return 1;
         }
+    }
+    return 0;
+}
+
+
+
+DECLFOLDER(constfold_mod)
+{
+    Opcode &op (rop.inst()->ops()[opnum]);
+    Symbol &A (*rop.inst()->argsymbol(op.firstarg()+1));
+    Symbol &B (*rop.inst()->argsymbol(op.firstarg()+2));
+
+    if (rop.is_zero(A)) {
+        // R = 0 % B  =>   R = 0
+        rop.turn_into_assign_zero (op, "0 % A => 0");
+        return 1;
+    }
+    if (rop.is_zero(B)) {
+        // R = A % 0   =>   R = 0
+        rop.turn_into_assign_zero (op, "A % 0 => 0");
+        return 1;
+    }
+    if (A.is_constant() && B.is_constant() &&
+        A.typespec().is_int() && B.typespec().is_int()) {
+        int a = A.get_int();
+        int b = B.get_int();
+        int cind = rop.add_constant (b ? (a % b) : 0);
+        rop.turn_into_assign (op, cind, "const % const");
+        return 1;
     }
     return 0;
 }
@@ -747,19 +779,32 @@ DECLFOLDER(constfold_aref)
     if (A.is_constant() && Index.is_constant()) {
         TypeSpec elemtype = A.typespec().elementtype();
         ASSERT (equivalent(elemtype, R.typespec()));
-        int index = *(int *)Index.data();
-        if (index < 0 || index >= A.typespec().arraylength()) {
-            // We are indexing a const array out of range.  But this
-            // isn't necessarily a reportable error, because it may be a
-            // code path that will never be taken.  Punt -- don't
-            // optimize this op, leave it to the execute-time range
-            // check to catch, if indeed it is a problem.
-            return 0;
-        }
-        ASSERT (index < A.typespec().arraylength());
+        const int length = A.typespec().arraylength();
+        const int orig_index = *(int *)Index.data(), index = OIIO::clamp(orig_index, 0, length - 1);
+        DASSERT(index >=0 && index < length);
         int cind = rop.add_constant (elemtype,
                         (char *)A.data() + index*elemtype.simpletype().size());
         rop.turn_into_assign (op, cind, "aref const fold: const_array[const]");
+        if (rop.shadingsys().range_checking() && index != orig_index) {
+            // the original index was out of range, and the user cares about reporting errors
+            const int args_to_add[] = {
+                    rop.add_constant(u_fmt_range_check),
+                    rop.add_constant(orig_index),
+                    rop.add_constant(A.name()),
+                    rop.add_constant(length - 1),
+                    rop.add_constant(op.sourcefile()),
+                    rop.add_constant(op.sourceline()),
+                    rop.add_constant(rop.group().name()),
+                    rop.add_constant(rop.layer()),
+                    rop.add_constant(rop.inst()->layername()),
+                    rop.add_constant(ustring(rop.inst()->shadername()))
+            };
+            rop.insert_code(opnum, u_error, args_to_add,
+                         RuntimeOptimizer::RecomputeRWRanges,
+                         RuntimeOptimizer::GroupWithNext);
+            Opcode &newop (rop.inst()->ops()[opnum]);
+            newop.argreadonly(0);
+        }
         return 1;
     }
     // Even if the index isn't constant, we still know the answer if all
@@ -1133,13 +1178,27 @@ DECLFOLDER(constfold_hash)
 {
     // Try to turn R=hash(s) into R=C
     Opcode &op (rop.inst()->ops()[opnum]);
-    Symbol &S (*rop.inst()->argsymbol(op.firstarg()+1));
-    if (S.is_constant()) {
-        ASSERT (S.typespec().is_string());
-        int result = (int) (*(ustring *)S.data()).hash();
-        int cind = rop.add_constant (result);
-        rop.turn_into_assign (op, cind, "const fold hash");
-        return 1;
+    Symbol *S (rop.inst()->argsymbol(op.firstarg()+1));
+    Symbol *T (op.nargs() > 2 ? rop.inst()->argsymbol(op.firstarg()+2) : NULL);
+    if (S->is_constant() && (T == NULL || T->is_constant())) {
+        int cind = -1;
+        if (S->typespec().is_string()) {
+            cind = rop.add_constant ((int) (*(ustring *)S->data()).hash());
+        } else if (op.nargs() == 2 && S->typespec().is_int()) {
+            cind = rop.add_constant (inthashi (S->get_int()));
+        } else if (op.nargs() == 2 && S->typespec().is_float()) {
+            cind = rop.add_constant (inthashf (S->get_float()));
+        } else if (op.nargs() == 3 && S->typespec().is_float() && T->typespec().is_float()) {
+            cind = rop.add_constant (inthashf (S->get_float(), T->get_float()));
+        } else if (op.nargs() == 2 && S->typespec().is_triple()) {
+            cind = rop.add_constant (inthashf ((const float *)S->data()));
+        } else if (op.nargs() == 3 && S->typespec().is_triple() && T->typespec().is_float()) {
+            cind = rop.add_constant (inthashf ((const float *)S->data(), T->get_float()));
+        }
+        if (cind >= 0) {
+            rop.turn_into_assign (op, cind, "const fold hash");
+            return 1;
+        }
     }
     return 0;
 }
@@ -1198,7 +1257,7 @@ DECLFOLDER(constfold_stoi)
     if (S.is_constant()) {
         ASSERT (S.typespec().is_string());
         ustring s = *(ustring *)S.data();
-        int cind = rop.add_constant ((int) strtol(s.c_str(), NULL, 10));
+        int cind = rop.add_constant (Strutil::from_string<int>(s));
         rop.turn_into_assign (op, cind, "const fold stoi");
         return 1;
     }
@@ -1215,7 +1274,7 @@ DECLFOLDER(constfold_stof)
     if (S.is_constant()) {
         ASSERT (S.typespec().is_string());
         ustring s = *(ustring *)S.data();
-        int cind = rop.add_constant ((float) strtod(s.c_str(), NULL));
+        int cind = rop.add_constant (Strutil::from_string<float>(s));
         rop.turn_into_assign (op, cind, "const fold stof");
         return 1;
     }
@@ -1253,12 +1312,10 @@ DECLFOLDER(constfold_split)
         for (int i = 0;  i < n;  ++i)
             usplits[i] = ustring(splits[i]);
         int cind = rop.add_constant (TypeDesc(TypeDesc::STRING,resultslen),
-                                     &usplits[0]);
+                                     usplits.data());
         // And insert an instruction copying our constant array to the
         // user's results array.
-        std::vector<int> args;
-        args.push_back (resultsarg);
-        args.push_back (cind);
+        const int args[] = { resultsarg, cind };
         rop.insert_code (opnum, u_assign, args,
                          RuntimeOptimizer::RecomputeRWRanges,
                          RuntimeOptimizer::GroupWithNext);
@@ -1346,15 +1403,15 @@ DECLFOLDER(constfold_format)
         std::string formatted;
         const TypeSpec &argtype = Arg.typespec();
         if (argtype.is_int())
-            formatted = Strutil::format (mid.c_str(), *(int *)Arg.data());
+            formatted = Strutil::sprintf (mid.c_str(), *(int *)Arg.data());
         else if (argtype.is_float())
-            formatted = Strutil::format (mid.c_str(), *(float *)Arg.data());
+            formatted = Strutil::sprintf (mid.c_str(), *(float *)Arg.data());
         else if (argtype.is_triple())
-            formatted = Strutil::format (mid.c_str(), *(Vec3 *)Arg.data());
+            formatted = Strutil::sprintf (mid.c_str(), *(Vec3 *)Arg.data());
         else if (argtype.is_matrix())
-            formatted = Strutil::format (mid.c_str(), *(Matrix44 *)Arg.data());
+            formatted = Strutil::sprintf (mid.c_str(), *(Matrix44 *)Arg.data());
         else if (argtype.is_string())
-            formatted = Strutil::format (mid.c_str(), *(ustring *)Arg.data());
+            formatted = Strutil::sprintf (mid.c_str(), *(ustring *)Arg.data());
         else
             break;   // something else we don't handle -- we're done
 
@@ -1430,8 +1487,8 @@ DECLFOLDER(constfold_regex_search)
         DASSERT (Subj.typespec().is_string() && Reg.typespec().is_string());
         const ustring &s (*(ustring *)Subj.data());
         const ustring &r (*(ustring *)Reg.data());
-        boost::regex reg (r.string());
-        int result = boost::regex_search (s.string(), reg);
+        regex reg (r.string());
+        int result = regex_search (s.string(), reg);
         int cind = rop.add_constant (result);
         rop.turn_into_assign (op, cind, "const fold regex_search");
         return 1;
@@ -1626,6 +1683,37 @@ DECLFOLDER(constfold_mix)
         return 1;
     }
 
+    return 0;
+}
+
+
+
+DECLFOLDER(constfold_select)
+{
+    // Try to turn R=select(a,b,cond) into (per component):
+    //   R[c] = a          if cond is constant and zero
+    //   R[c] = b          if cond is constant and nonzero
+    //   R = a             if a == b (even if nothing is constant)
+    //
+    Opcode &op (rop.inst()->ops()[opnum]);
+    // int Rind = rop.oparg(op,0);
+    int Aind = rop.oparg(op,1);
+    int Bind = rop.oparg(op,2);
+    int Cind = rop.oparg(op,3);
+    Symbol &C (*rop.inst()->symbol(Cind));
+
+    if (C.is_constant() && rop.is_zero(C)) {
+        rop.turn_into_assign (op, Aind, "select(A,B,0) => A");
+        return 1;
+    }
+    if (C.is_constant() && rop.is_nonzero(C)) {
+        rop.turn_into_assign (op, Bind, "select(A,B,non-0) => B");
+        return 1;
+    }
+    if (Aind == Bind) {
+        rop.turn_into_assign (op, Aind, "select(c,a,a) -> a");
+        return 1;
+    }
     return 0;
 }
 
@@ -1848,15 +1936,10 @@ DECLFOLDER(constfold_sincos)
         rop.turn_into_new_op (op, u_assign, sinarg, rop.add_constant (s), -1,
                               "const fold sincos");
         // And insert a new op for the cos assignment
-        std::vector<int> args_to_add;
-        args_to_add.push_back (cosarg);
-        args_to_add.push_back (rop.add_constant (c));
+        const int args_to_add[] = { cosarg, rop.add_constant (c) };
         rop.insert_code (opnum, u_assign, args_to_add,
                          RuntimeOptimizer::RecomputeRWRanges,
                          RuntimeOptimizer::GroupWithNext);
-        Opcode &newop (rop.inst()->ops()[opnum]);
-        newop.argwriteonly (0);
-        newop.argreadonly (1);
         return 1;
     }
     return 0;
@@ -2074,17 +2157,11 @@ DECLFOLDER(constfold_getmatrix)
 
         // Now insert a new instruction that assigns 1 to the
         // original return result of getmatrix.
-        int one = 1;
-        std::vector<int> args_to_add;
-        args_to_add.push_back (resultarg);
-        args_to_add.push_back (rop.add_constant (TypeDesc::TypeInt, &one));
+        const int one = 1;
+        const int args_to_add[] = { resultarg, rop.add_constant (TypeDesc::TypeInt, &one) };
         rop.insert_code (opnum, u_assign, args_to_add,
                          RuntimeOptimizer::RecomputeRWRanges,
                          RuntimeOptimizer::GroupWithNext);
-        Opcode &newop (rop.inst()->ops()[opnum]);
-        newop.argwriteonly (0);
-        newop.argread (1, true);
-        newop.argwrite (1, false);
         return 1;
     }
     return 0;
@@ -2118,6 +2195,39 @@ DECLFOLDER(constfold_transform)
                                       "transform by identity");
                 return 1;
             }
+        }
+    }
+    return 0;
+}
+
+
+
+DECLFOLDER(constfold_transformc)
+{
+    Opcode &op (rop.inst()->ops()[opnum]);
+    // Symbol &Result = *rop.opargsym (op, 0);
+    Symbol &From = *rop.opargsym (op, 1);
+    Symbol &To = *rop.opargsym (op, 2);
+    Symbol &C = *rop.opargsym (op, 3);
+
+    if (From.is_constant() && To.is_constant()) {
+        ustring from = From.get_string();
+        ustring to = To.get_string();
+        if (from == Strings::RGB)
+            from = Strings::rgb;
+        if (to == Strings::RGB)
+            to = Strings::rgb;
+        if (from == to) {
+            rop.turn_into_assign (op, rop.inst()->arg(op.firstarg()+3),
+                                  "transformc by identity");
+            return 1;
+        }
+        if (C.is_constant()) {
+            Color3 Cin (C.get_float(0), C.get_float(1), C.get_float(2));
+            Color3 result = rop.shadingsys().colorsystem().transformc (from, to, Cin, rop.shadingcontext());
+            rop.turn_into_assign (op, rop.add_constant(result),
+                                  "transformc => constant");
+            return 1;
         }
     }
     return 0;
@@ -2214,7 +2324,11 @@ DECLFOLDER(constfold_getattribute)
     bool found = false;
 
     // Check global things first
-    if (attr_name == "shader:shadername" && attr_type == TypeDesc::TypeString) {
+    if (attr_name == "osl:version" && attr_type == TypeDesc::TypeInt) {
+        int *val = (int *)(char *)buf;
+        *val = OSL_VERSION;
+        found = true;
+    } else if (attr_name == "shader:shadername" && attr_type == TypeDesc::TypeString) {
         ustring *up = (ustring *)(char *)buf;
         *up = ustring(rop.inst()->shadername());
         found = true;
@@ -2236,7 +2350,7 @@ DECLFOLDER(constfold_getattribute)
         ustring obj_name;
         if (object_lookup)
             obj_name = *(const ustring *)ObjectName.data();
-        if (! obj_name)
+        if (obj_name.empty())
             return 0;
 
         found = array_lookup
@@ -2264,17 +2378,11 @@ DECLFOLDER(constfold_getattribute)
         rop.turn_into_assign (op, cind, "const fold getattribute");
         // Now insert a new instruction that assigns 1 to the
         // original return result of getattribute.
-        int one = 1;
-        std::vector<int> args_to_add;
-        args_to_add.push_back (oldresultarg);
-        args_to_add.push_back (rop.add_constant (TypeDesc::TypeInt, &one));
+        const int one = 1;
+        const int args_to_add[] = { oldresultarg, rop.add_constant (TypeDesc::TypeInt, &one) };
         rop.insert_code (opnum, u_assign, args_to_add,
                          RuntimeOptimizer::RecomputeRWRanges,
                          RuntimeOptimizer::GroupWithNext);
-        Opcode &newop (rop.inst()->ops()[opnum]);
-        newop.argwriteonly (0);
-        newop.argread (1, true);
-        newop.argwrite (1, false);
         return 1;
     } else {
         return 0;
@@ -2293,23 +2401,27 @@ DECLFOLDER(constfold_gettextureinfo)
     ASSERT (Result.typespec().is_int() && Filename.typespec().is_string() &&
             Dataname.typespec().is_string());
 
-    if (Filename.is_constant() && Dataname.is_constant() &&
-            ! Data.typespec().is_array() /* N.B. we punt on arrays */) {
+    if (Filename.is_constant() && Dataname.is_constant()) {
         ustring filename = *(ustring *)Filename.data();
         ustring dataname = *(ustring *)Dataname.data();
         TypeDesc t = Data.typespec().simpletype();
         void *mydata = alloca (t.size ());
         // FIXME(ptex) -- exclude folding of ptex, since these things
         // can vary per face.
-        int result = rop.renderer()->get_texture_info (NULL, filename, NULL, 0,
-                                                       dataname, t, mydata);
+        ustring errormessage;
+        int result = rop.renderer()->get_texture_info (filename, nullptr,
+                                                       rop.shadingcontext()->texture_thread_info(),
+                                                       rop.shadingcontext(),
+                                                       0 /* TODO: subimage? */,
+                                                       dataname, t, mydata, &errormessage);
         // Now we turn
         //       gettextureinfo result filename dataname data
         // into this for success:
-        //       assign result 1
         //       assign data [retrieved values]
-        // but if it fails, don't change anything, because we want it to
-        // issue errors at runtime.
+        //       assign result 1
+        // into this for failure:
+        //       error "%s" errormesage
+        //       assign result 0
         if (result) {
             int oldresultarg = rop.inst()->args()[op.firstarg()+0];
             int dataarg = rop.inst()->args()[op.firstarg()+3];
@@ -2322,23 +2434,31 @@ DECLFOLDER(constfold_gettextureinfo)
             // Now insert a new instruction that assigns 1 to the
             // original return result of gettextureinfo.
             int one = 1;
-            std::vector<int> args_to_add;
-            args_to_add.push_back (oldresultarg);
-            args_to_add.push_back (rop.add_constant (TypeDesc::TypeInt, &one));
+            const int args_to_add[] = {
+                oldresultarg,
+                rop.add_constant (TypeDesc::TypeInt, &one)
+            };
             rop.insert_code (opnum, u_assign, args_to_add,
                              RuntimeOptimizer::RecomputeRWRanges,
                              RuntimeOptimizer::GroupWithNext);
-            Opcode &newop (rop.inst()->ops()[opnum]);
-            newop.argwriteonly (0);
-            newop.argread (1, true);
-            newop.argwrite (1, false);
             return 1;
         } else {
-            // Return without constant folding gettextureinfo -- because
-            // we WANT the shader to fail and issue error messages at
-            // the appropriate time.
-            (void) rop.texturesys()->geterror (); // eat the error
-            return 0;
+            // Constant fold to 0
+            rop.turn_into_assign_zero (op, "const fold gettextureinfo");
+            if (errormessage.size()) {
+                // display the error message if control flow ever reaches here
+                const int args_to_add[] = {
+                    rop.add_constant(u_fmterror),
+                    rop.add_constant(errormessage)
+                };
+                rop.insert_code(opnum, u_error, args_to_add,
+                                 RuntimeOptimizer::RecomputeRWRanges,
+                                 RuntimeOptimizer::GroupWithNext);
+                Opcode &newop (rop.inst()->ops()[opnum]);
+                newop.argreadonly(0);
+                newop.argreadonly(1);
+            }
+            return 1;
         }
     }
     return 0;
@@ -2430,9 +2550,18 @@ DECLFOLDER(constfold_texture)
 #endif
             CHECK_str (width, float, TypeDesc::FLOAT)
             else CHECK_str (blur, float, TypeDesc::FLOAT)
-            else CHECK_str (wrap, ustring, TypeDesc::STRING)
             else CHECK (firstchannel, int, TypeDesc::INT)
             else CHECK (fill, float, TypeDesc::FLOAT)
+
+            else if ((name == Strings::wrap || name == Strings::swrap ||
+                 name == Strings::twrap || name == Strings::rwrap)
+                 && value && valuetype == TypeDesc::STRING) {
+                // Special trick is needed for wrap modes because the input
+                // is a string but the field we're setting is an int enum.
+                OIIO::Tex::Wrap wrapmode = OIIO::Tex::decode_wrapmode (*(ustring *)value);
+                void* value = &wrapmode;
+                CHECK_str (wrap, int, TypeDesc::INT);
+            }
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif
@@ -2557,14 +2686,10 @@ DECLFOLDER(constfold_pointcloud_search)
     for (int i = 0; i < nattrs; ++i) {
         // We had stashed names, data types, and destinations earlier.
         // Retrieve them now to build a query.
-        if (! names[i])
+        if (names[i].empty())
             continue;
         void *const_data = NULL;
         TypeDesc const_valtype = value_types[i];
-        // How big should the constant arrays be?  Shrink to the size of
-        // the results if they are much smaller.
-        if (count < const_valtype.arraylen/2 && const_valtype.arraylen > 8)
-            const_valtype.arraylen = count;
         tmp.clear ();
         tmp.resize (const_valtype.size(), 0);
         const_data = &tmp[0];
@@ -2597,9 +2722,7 @@ DECLFOLDER(constfold_pointcloud_search)
         int const_array_sym = rop.add_constant (const_valtype, const_data);
         // ... and add an instruction to copy the constant into the
         // original destination for the query.
-        std::vector<int> args_to_add;
-        args_to_add.push_back (value_args[i]);
-        args_to_add.push_back (const_array_sym);
+        const int args_to_add[] = { value_args[i], const_array_sym };
         rop.insert_code (opnum, u_assign, args_to_add,
                          RuntimeOptimizer::RecomputeRWRanges,
                          RuntimeOptimizer::GroupWithNext);
@@ -2607,9 +2730,7 @@ DECLFOLDER(constfold_pointcloud_search)
 
     // Query results all copied.  The only thing left to do is to assign
     // status (query result count) to the original "result".
-    std::vector<int> args_to_add;
-    args_to_add.push_back (result_sym);
-    args_to_add.push_back (rop.add_constant (TypeDesc::TypeInt, &count));
+    const int args_to_add[] = { result_sym, rop.add_constant (TypeDesc::TypeInt, &count) };
     rop.insert_code (opnum, u_assign, args_to_add,
                      RuntimeOptimizer::RecomputeRWRanges,
                      RuntimeOptimizer::GroupWithNext);
@@ -2655,7 +2776,7 @@ DECLFOLDER(constfold_pointcloud_get)
     int ok = rop.renderer()->pointcloud_get (rop.shaderglobals(), filename,
                                              indices, count,
                                              *(ustring *)Attr_name.data(),
-                                             valtype.elementtype(), &data[0]);
+                                             valtype, &data[0]);
     rop.shadingsys().pointcloud_stats (0, 1, 0);
 
     rop.turn_into_assign (op, rop.add_constant (TypeDesc::TypeInt, &ok),
@@ -2665,9 +2786,7 @@ DECLFOLDER(constfold_pointcloud_get)
     int const_array_sym = rop.add_constant (valtype, &data[0]);
     // ... and add an instruction to copy the constant into the
     // original destination for the query.
-    std::vector<int> args_to_add;
-    args_to_add.push_back (rop.oparg(op,5) /* Data symbol*/);
-    args_to_add.push_back (const_array_sym);
+    const int args_to_add[] = { rop.oparg(op,5) /* Data symbol*/, const_array_sym };
     rop.insert_code (opnum, u_assign, args_to_add,
                      RuntimeOptimizer::RecomputeRWRanges,
                      RuntimeOptimizer::GroupWithNext);

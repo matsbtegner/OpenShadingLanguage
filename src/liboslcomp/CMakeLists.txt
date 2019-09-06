@@ -20,8 +20,17 @@ else ()
     ADD_LIBRARY ( oslcomp SHARED ${liboslcomp_srcs} )
 endif ()
 
-TARGET_LINK_LIBRARIES ( oslcomp ${OPENIMAGEIO_LIBRARY} ${ILMBASE_LIBRARIES}
-                       ${Boost_LIBRARIES} ${CMAKE_DL_LIBS})
+set_target_properties (oslcomp
+                       PROPERTIES
+                       VERSION ${OSL_VERSION_MAJOR}.${OSL_VERSION_MINOR}.${OSL_VERSION_PATCH}
+                       SOVERSION ${SOVERSION}
+                       OUTPUT_NAME oslcomp${OSL_LIBNAME_SUFFIX}
+                       )
 
-INSTALL ( TARGETS oslcomp RUNTIME DESTINATION bin LIBRARY DESTINATION lib ARCHIVE DESTINATION lib )
+TARGET_LINK_LIBRARIES ( oslcomp ${OPENIMAGEIO_LIBRARIES} ${ILMBASE_LIBRARIES}
+                       ${Boost_LIBRARIES} ${CMAKE_DL_LIBS}
+                       ${CLANG_LIBRARIES} ${LLVM_LIBRARIES} ${LLVM_LDFLAGS}
+                       ${LLVM_SYSTEM_LIBRARIES})
+
+install_targets (oslcomp)
 

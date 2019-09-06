@@ -44,41 +44,81 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 // same if another packages is compiling against OSL and using these headers
 // (OSL may be C++11 but the client package may be older, or vice versa --
 // use these two symbols to differentiate these cases, when important).
-#if (__cplusplus >= 201402L)
-#  define OSL_CPLUSPLUS_VERSION  14
-#elif (__cplusplus >= 201103L)
-#  define OSL_CPLUSPLUS_VERSION  11
+#if (__cplusplus >= 201703L)
+#    define OSL_CPLUSPLUS_VERSION 17
+#    define OSL_CONSTEXPR14 constexpr
+#    define OSL_CONSTEXPR17 constexpr
+#    define OSL_CONSTEXPR20 /* not constexpr before C++20 */
+#elif (__cplusplus >= 201402L)
+#    define OSL_CPLUSPLUS_VERSION 14
+#    define OSL_CONSTEXPR14 constexpr
+#    define OSL_CONSTEXPR17 /* not constexpr before C++17 */
+#    define OSL_CONSTEXPR20 /* not constexpr before C++20 */
+#elif (__cplusplus >= 201103L) || _MSC_VER >= 1900
+#    define OSL_CPLUSPLUS_VERSION 11
+#    define OSL_CONSTEXPR14 /* not constexpr before C++14 */
+#    define OSL_CONSTEXPR17 /* not constexpr before C++17 */
+#    define OSL_CONSTEXPR20 /* not constexpr before C++20 */
 #else
-#  define OSL_CPLUSPLUS_VERSION  3 /* presume C++03 */
+#    error "This version of OSL requires C++11"
+#endif
+
+#ifndef OSL_HOSTDEVICE
+#  ifdef __CUDACC__
+#    define OSL_HOSTDEVICE __host__ __device__
+#  else
+#    define OSL_HOSTDEVICE
+#  endif
+#endif
+
+#ifndef OSL_DEVICE
+#  ifdef __CUDA_ARCH__
+#    define OSL_DEVICE __device__
+#  else
+#    define OSL_DEVICE
+#  endif
+#endif
+
+#ifndef OSL_CONSTANT_DATA
+#  ifdef __CUDA_ARCH__
+#    define OSL_CONSTANT_DATA __constant__
+#  else
+#    define OSL_CONSTANT_DATA
+#  endif
 #endif
 
 // Symbol export defines
 #include "export.h"
 
+#include <OSL/oslversion.h>
+
 // All the things we need from Imath
-#include <OpenEXR/ImathVec.h>
-#include <OpenEXR/ImathColor.h>
-#include <OpenEXR/ImathMatrix.h>
+// When compiling for CUDA, we need to make sure the modified Imath
+// headers are included before the stock versions.
+#include <OSL/Imathx.h>
 
 // All the things we need from OpenImageIO
-#include <OpenImageIO/version.h>
+#include <OpenImageIO/oiioversion.h>
 #include <OpenImageIO/errorhandler.h>
 #include <OpenImageIO/texture.h>
 #include <OpenImageIO/typedesc.h>
 #include <OpenImageIO/ustring.h>
 #include <OpenImageIO/platform.h>
+#include <OpenImageIO/span.h>
 
-// Sort out smart pointers
-#if OSL_CPLUSPLUS_VERSION >= 11
-# include <memory>
-#else /* FIXME(C++11): remove this after making C++11 the baseline */
-# include <boost/shared_ptr.hpp>
+// If we're using an old version of OIIO prior to the introduction of
+// Strutil::sprintf, define it ourselves to be a synonym for format.
+#ifndef OIIO_HAS_SPRINTF
+OIIO_NAMESPACE_BEGIN
+namespace Strutil {
+template<typename... Args>
+inline std::string sprintf (const char* fmt, const Args&... args) {
+    return Strutil::format (fmt, args...);
+}
+} // namespace strutil
+OIIO_NAMESPACE_END
 #endif
 
-// Extensions to Imath
-#include "matrix22.h"
-
-#include "oslversion.h"
 
 OSL_NAMESPACE_ENTER
 
@@ -120,30 +160,44 @@ using OIIO::TypeDesc;
 using OIIO::ustring;
 using OIIO::ustringHash;
 using OIIO::string_view;
+using OIIO::span;
+using OIIO::cspan;
 
-// Sort out smart pointers
-#if OSL_CPLUSPLUS_VERSION >= 11
-  using std::shared_ptr;
-  using std::weak_ptr;
-#else /* FIXME(C++11): remove this after making C++11 the baseline */
-  using boost::shared_ptr;
-  using boost::weak_ptr;
+
+// In C++20 (and some compilers before that), __has_cpp_attribute can
+// test for understand of [[attr]] tests.
+#ifndef __has_cpp_attribute
+#    define __has_cpp_attribute(x) 0
 #endif
 
+// On gcc & clang, __has_attribute can test for __attribute__((attr))
 #ifndef __has_attribute
-#  define __has_attribute(x) 0
+#    define __has_attribute(x) 0
 #endif
 
-#if OSL_CPLUSPLUS_VERSION >= 14 && __has_attribute(deprecated)
+// In C++17 (and some compilers before that), __has_include("blah.h") or
+// __has_include(<blah.h>) can test for presence of an include file.
+#ifndef __has_include
+#    define __has_include(x) 0
+#endif
+
+
+#if OSL_CPLUSPLUS_VERSION >= 14 || __has_cpp_attribute(deprecated)
 #  define OSL_DEPRECATED(msg) [[deprecated(msg)]]
-#elif (defined(__GNUC__) && OIIO_GNUC_VERSION >= 40600) || defined(__clang__)
+#elif defined(__GNUC__) || defined(__clang__) || __has_attribute(deprecated)
 #  define OSL_DEPRECATED(msg) __attribute__((deprecated(msg)))
-#elif defined(__GNUC__) /* older gcc -- only the one with no message */
-#  define OSL_DEPRECATED(msg) __attribute__((deprecated))
 #elif defined(_MSC_VER)
 #  define OSL_DEPRECATED(msg) __declspec(deprecated(msg))
 #else
 #  define OSL_DEPRECATED(msg)
+#endif
+
+/// Work around bug in GCC with mixed __attribute__ and alignas parsing
+/// https://gcc.gnu.org/bugzilla/show_bug.cgi?id=69585
+#ifdef __GNUC__
+#  define OSL_ALIGNAS(size) __attribute__((aligned(size)))
+#else
+#  define OSL_ALIGNAS(size) alignas(size)
 #endif
 
 OSL_NAMESPACE_EXIT

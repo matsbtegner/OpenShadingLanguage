@@ -30,8 +30,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <cstdio>
 #include <cmath>
 
-#include <boost/foreach.hpp>
-
 #include <OpenImageIO/sysutil.h>
 #include <OpenImageIO/timer.h>
 #include <OpenImageIO/thread.h>
@@ -45,6 +43,7 @@ using namespace OSL::pvt;
 
 // names of ops we'll be using frequently
 static ustring u_nop    ("nop"),
+               u_exit   ("exit"),
                u_assign ("assign"),
                u_add    ("add"),
                u_sub    ("sub"),
@@ -125,9 +124,9 @@ RuntimeOptimizer::RuntimeOptimizer (ShadingSystemImpl &shadingsys,
       m_next_newconst(0), m_next_newtemp(0),
       m_stat_opt_locking_time(0), m_stat_specialization_time(0),
       m_stop_optimizing(false),
-      m_raytypes_on(0), m_raytypes_off(0)
+      m_raytypes_on(group.raytypes_on()), m_raytypes_off(group.raytypes_off())
 {
-    memset (&m_shaderglobals, 0, sizeof(ShaderGlobals));
+    memset ((char *)&m_shaderglobals, 0, sizeof(ShaderGlobals));
     m_shaderglobals.context = shadingcontext();
 }
 
@@ -171,15 +170,15 @@ OSOProcessorBase::set_debug ()
 
     // If either group or layer was specified for debug, surely they want
     // debugging turned on.
-    if (shadingsys().debug_groupname() || shadingsys().debug_layername())
+    if (!shadingsys().debug_groupname().empty() || !shadingsys().debug_layername().empty())
         m_debug = std::max (m_debug, 1);
 
     // Force debugging off if a specific group was selected for debug
     // and we're not it, or a specific layer was selected for debug and
     // we're not it.
-    bool wronggroup = (shadingsys().debug_groupname() && 
+    bool wronggroup = (!shadingsys().debug_groupname().empty() &&
                        shadingsys().debug_groupname() != group().name());
-    bool wronglayer = (shadingsys().debug_layername() && inst() &&
+    bool wronglayer = (!shadingsys().debug_layername().empty() && inst() &&
                        shadingsys().debug_layername() != inst()->layername());
     if (wronggroup || wronglayer)
         m_debug = 0;
@@ -194,7 +193,7 @@ RuntimeOptimizer::set_debug ()
 
     // If a specific group is isolated for debugging and  the
     // 'optimize_dondebug' flag is on, fully optimize all other groups.
-    if (shadingsys().debug_groupname() &&
+    if (!shadingsys().debug_groupname().empty() &&
         shadingsys().debug_groupname() != group().name()) {
         if (shadingsys().m_optimize_nondebug) {
             // Debugging trick: if user said to only debug one group, turn
@@ -221,12 +220,12 @@ RuntimeOptimizer::set_debug ()
 int
 RuntimeOptimizer::find_constant (const TypeSpec &type, const void *data)
 {
-    for (int i = 0;  i < (int)m_all_consts.size();  ++i) {
-        const Symbol &s (*inst()->symbol(m_all_consts[i]));
+    for (int c : m_all_consts) {
+        const Symbol &s (*inst()->symbol(c));
         ASSERT (s.symtype() == SymTypeConst);
         if (equivalent (s.typespec(), type) &&
               !memcmp (s.data(), data, s.typespec().simpletype().size())) {
-            return m_all_consts[i];
+            return c;
         }
     }
     return -1;
@@ -350,9 +349,9 @@ RuntimeOptimizer::debug_opt_ops (int opbegin, int opend, string_view message) co
     const Opcode &op (inst()->ops()[opbegin]);
     std::string oprange;
     if (opbegin >= 0 && opend-opbegin > 1)
-        oprange = Strutil::format ("ops %d-%d ", opbegin, opend);
+        oprange = Strutil::sprintf ("ops %d-%d ", opbegin, opend);
     else if (opbegin >= 0)
-        oprange = Strutil::format ("op %d ", opbegin);
+        oprange = Strutil::sprintf ("op %d ", opbegin);
     debug_opt ("%s%s (@ %s:%d)\n", oprange, message,
                op.sourcefile(), op.sourceline());
 }
@@ -368,18 +367,18 @@ RuntimeOptimizer::debug_turn_into (const Opcode &op, int numops,
     int opnum = &op - &(inst()->ops()[0]);
     std::string msg;
     if (numops == 1)
-        msg = Strutil::format ("turned '%s' to '%s", op_string(op), newop);
+        msg = Strutil::sprintf ("turned '%s' to '%s", op_string(op), newop);
     else
-        msg = Strutil::format ("turned to '%s", newop);
+        msg = Strutil::sprintf ("turned to '%s", newop);
     if (newarg0 >= 0)
-        msg += Strutil::format (" %s", inst()->symbol(newarg0)->name());
+        msg += Strutil::sprintf (" %s", inst()->symbol(newarg0)->name());
     if (newarg1 >= 0)
-        msg += Strutil::format (" %s", inst()->symbol(newarg1)->name());
+        msg += Strutil::sprintf (" %s", inst()->symbol(newarg1)->name());
     if (newarg2 >= 0)
-        msg += Strutil::format (" %s", inst()->symbol(newarg2)->name());
+        msg += Strutil::sprintf (" %s", inst()->symbol(newarg2)->name());
     msg += "'";
     if (why.size())
-        msg += Strutil::format (" : %s", why);
+        msg += Strutil::sprintf (" : %s", why);
     debug_opt_ops (opnum, opnum+numops, msg);
 }
 
@@ -497,17 +496,17 @@ RuntimeOptimizer::turn_into_nop (int begin, int end, string_view why)
 
 void
 RuntimeOptimizer::insert_code (int opnum, ustring opname,
-                               const int *argsbegin, const int *argsend,
+                               const cspan<int> args_to_add,
                                RecomputeRWRangesOption recompute_rw_ranges,
                                InsertRelation relation)
 {
     OpcodeVec &code (inst()->ops());
     std::vector<int> &opargs (inst()->args());
     ustring method = (opnum < (int)code.size()) ? code[opnum].method() : OSLCompilerImpl::main_method_name();
-    int nargs = argsend - argsbegin;
+    int nargs = args_to_add.size();
     Opcode op (opname, method, opargs.size(), nargs);
     code.insert (code.begin()+opnum, op);
-    opargs.insert (opargs.end(), argsbegin, argsend);
+    opargs.insert (opargs.end(), args_to_add.begin(), args_to_add.end());
     if (opnum < inst()->m_maincodebegin)
         ++inst()->m_maincodebegin;
     ++inst()->m_maincodeend;
@@ -522,8 +521,7 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
     // the jump addresses of other ops and the param init ranges.
     if (opnum < (int)code.size()-1) {
         // Adjust jump offsets
-        for (size_t n = 0;  n < code.size();  ++n) {
-            Opcode &c (code[n]);
+        for (auto& c : code) {
             for (int j = 0; j < (int)Opcode::max_jumps && c.jump(j) >= 0; ++j) {
                 if (c.jump(j) > opnum) {
                     c.jump(j) = c.jump(j) + 1;
@@ -532,7 +530,7 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
             }
         }
         // Adjust param init ranges
-        FOREACH_PARAM (Symbol &s, inst()) {
+        FOREACH_PARAM (auto&& s, inst()) {
             if (s.initbegin() > opnum)
                 s.initbegin (s.initbegin()+1);
             if (s.initend() > opnum)
@@ -543,7 +541,7 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
     // Inserting the instruction may change the read/write ranges of
     // symbols.  Not adjusting this can throw off other optimizations.
     if (recompute_rw_ranges) {
-        BOOST_FOREACH (Symbol &s, inst()->symbols()) {
+        for (auto&& s : inst()->symbols()) {
             if (s.everread()) {
                 int first = s.firstread(), last = s.lastread();
                 if (first >= opnum)
@@ -585,7 +583,7 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
 
     if (opname == u_if) {
         // special case for 'if' -- the arg is read, not written
-        inst()->symbol(argsbegin[0])->mark_rw (opnum, true, false);
+        inst()->symbol(args_to_add[0])->mark_rw (opnum, true, false);
     }
     else if (opname != u_useparam) {
         // Mark the args as being used for this op (assume that the
@@ -593,26 +591,9 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
         // DASSERT to be sure we only use insert_code for the couple of
         // instructions that we think it is used for.
         for (int a = 0;  a < nargs;  ++a)
-            inst()->symbol(argsbegin[a])->mark_rw (opnum, a>0, a==0);
+            inst()->symbol(args_to_add[a])->mark_rw (opnum, a>0, a==0);
     }
 }
-
-
-
-void
-RuntimeOptimizer::insert_code (int opnum, ustring opname,
-                               const std::vector<int> &args_to_add,
-                               RecomputeRWRangesOption recompute_rw_ranges,
-                               InsertRelation relation)
-{
-    const int *argsbegin = (args_to_add.size())? &args_to_add[0]: NULL;
-    const int *argsend = argsbegin + args_to_add.size();
-
-    insert_code (opnum, opname, argsbegin, argsend,
-                 recompute_rw_ranges, relation);
-}
-
-
 
 void
 RuntimeOptimizer::insert_code (int opnum, ustring opname,
@@ -625,7 +606,7 @@ RuntimeOptimizer::insert_code (int opnum, ustring opname,
     if (arg1 >= 0) args[nargs++] = arg1;
     if (arg2 >= 0) args[nargs++] = arg2;
     if (arg3 >= 0) args[nargs++] = arg3;
-    insert_code (opnum, opname, args, args+nargs, RecomputeRWRanges, relation);
+    insert_code (opnum, opname, cspan<int>(args, args + nargs), RecomputeRWRanges, relation);
 }
 
 
@@ -666,7 +647,7 @@ RuntimeOptimizer::add_useparam (SymbolPtrVec &allsyms)
     std::vector<int> &opargs (inst()->args());
 
     // Mark all symbols as un-initialized
-    BOOST_FOREACH (Symbol &s, inst()->symbols())
+    for (auto&& s : inst()->symbols())
         s.initialized (false);
 
     if (inst()->m_maincodebegin < 0)
@@ -735,7 +716,7 @@ RuntimeOptimizer::add_useparam (SymbolPtrVec &allsyms)
     }
 
     // Mark all symbols as un-initialized
-    BOOST_FOREACH (Symbol &s, inst()->symbols())
+    for (auto&& s : inst()->symbols())
         s.initialized (false);
 
     // Re-track variable lifetimes, since the inserted useparam
@@ -776,6 +757,32 @@ OSOProcessorBase::is_one (const Symbol &A)
 
 
 
+bool
+OSOProcessorBase::is_nonzero (const Symbol &A)
+{
+    if (! A.is_constant())
+        return false;
+    const TypeSpec &Atype (A.typespec());
+    int ncomponents = Atype.numelements() * Atype.aggregate();
+    if (Atype.is_float_based()) {
+        const float *val = (const float *)A.data();
+        for (int i = 0; i < ncomponents; ++i)
+            if (val[0] == 0.0f)
+                return false;
+        return true;
+    }
+    if (Atype.is_int_based()) {
+        const int *val = (const int *)A.data();
+        for (int i = 0; i < ncomponents; ++i)
+            if (val[0] == 0)
+                return false;
+        return true;
+    }
+    return false;
+}
+
+
+
 std::string
 OSOProcessorBase::const_value_as_string (const Symbol &A)
 {
@@ -784,6 +791,7 @@ OSOProcessorBase::const_value_as_string (const Symbol &A)
     TypeDesc type (A.typespec().simpletype());
     int n = type.numelements() * type.aggregate;
     std::ostringstream s;
+    s.imbue (std::locale::classic());  // force C locale
     if (type.basetype == TypeDesc::FLOAT) {
         for (int i = 0; i < n; ++i)
             s << (i ? "," : "") << ((const float *)A.data())[i];
@@ -897,12 +905,19 @@ RuntimeOptimizer::simplify_params ()
             // It's connected to an earlier layer.  If the output var of
             // the upstream shader is effectively constant or a global,
             // then so is this variable.
-            turn_into_nop (s->initbegin(), s->initend(),
-                           "connected value doesn't need init ops");
-            BOOST_FOREACH (Connection &c, inst()->connections()) {
-                if (c.dst.param == i) {
+            for (auto&& c : inst()->connections()) {
+                if (c.dst.param != i)
+                    continue;
+                if (c.dst.is_complete()) {
+                    /// All components are being set through either
+                    /// float->triple or triple->triple
+                    /// Get rid of the un-needed init ops.
+                    turn_into_nop (s->initbegin(), s->initend(),
+                                   "connected value doesn't need init ops");
+                }
+                if (c.is_complete()) {
                     // srcsym is the earlier group's output param, which
-                    // is connected as the input to the param we're
+                    // is fully connected as the input to the param we're
                     // examining.
                     ShaderInstance *uplayer = group()[c.srclayer];
                     Symbol *srcsym = uplayer->symbol(c.src.param);
@@ -914,8 +929,7 @@ RuntimeOptimizer::simplify_params ()
                     // If so, make sure the global is in this instance's
                     // symbol table, and alias the parameter to it.
                     ustringmap_t &g (m_params_holding_globals[c.srclayer]);
-                    ustringmap_t::const_iterator f;
-                    f = g.find (srcsym->name());
+                    auto f = g.find (srcsym->name());
                     if (f != g.end()) {
                         if (debug() > 1)
                             debug_opt ("Remapping %s.%s because it's connected to "
@@ -948,6 +962,20 @@ RuntimeOptimizer::simplify_params ()
                     }
                 }
             }
+            // FIXME / N.B.: We only optimize "fully complete" connections,
+            // not those involving individual components or array elements
+            // of the connected parameters, because we sure don't track the
+            // constness or aliasing of individual components/element, only
+            // whole variables. But there are two cases where the logic
+            // above fails to fully exploit the connection propagating a
+            // constant value. (a) Partial-to-whole connections, for example
+            // connecting one component of an upstream triple output to a
+            // downstream float input, should propagate the constant, but we
+            // currently neglect this case. (b) If *multiple* conections
+            // combine to fully propagate values, for example if someone was
+            // foolish enough to connect R, G, and B components of color
+            // parameters *separately*, we sure don't notice that and treat
+            // it as a full connection of the color.
         }
     }
 }
@@ -959,7 +987,7 @@ RuntimeOptimizer::simplify_params ()
 void
 RuntimeOptimizer::find_params_holding_globals ()
 {
-    FOREACH_PARAM (Symbol &s, inst()) {
+    FOREACH_PARAM (auto&& s, inst()) {
         // Skip if this isn't a shader output parameter that's connected
         // to a later layer.
         if (s.symtype() != SymTypeParam && s.symtype() != SymTypeOutputParam)
@@ -1054,10 +1082,10 @@ OSOProcessorBase::find_basic_blocks ()
         // any jump targets at all, it must be a conditional or loop.
         if (op.jump(0) >= 0)
             block_begin[opnum+1] = true;
-        // 'break', 'continue', and 'return' also cause the next
+        // 'break', 'continue', 'return', and 'exit' also cause the next
         // statement to begin a new basic block.
         if (op.opname() == u_break || op.opname() == u_continue ||
-                op.opname() == u_return)
+            op.opname() == u_return || op.opname() == u_exit)
             block_begin[opnum+1] = true;
     }
 
@@ -1169,12 +1197,13 @@ RuntimeOptimizer::use_stale_sym (int sym)
 
 
 bool
-RuntimeOptimizer::is_simple_assign (Opcode &op)
+RuntimeOptimizer::is_simple_assign (Opcode &op, const OpDescriptor *opd)
 {
     // Simple only if arg0 is the only write, and is write only.
     if (op.argwrite_bits() != 1 || op.argread(0))
         return false;
-    const OpDescriptor *opd = shadingsys().op_descriptor (op.opname());
+    if (! opd)
+        opd = shadingsys().op_descriptor (op.opname());
     if (!opd || !opd->simple_assign)
         return false;   // reject all other known non-simple assignments
     // Make sure the result isn't also read
@@ -1196,7 +1225,7 @@ RuntimeOptimizer::simple_sym_assign (int sym, int opnum)
             Opcode &uselessop (inst()->ops()[i->second]);
             if (uselessop.opname() != u_nop)
                 turn_into_nop (uselessop,
-                           debug() > 1 ? Strutil::format("remove stale value assignment to %s, reassigned on op %d",
+                           debug() > 1 ? Strutil::sprintf("remove stale value assignment to %s, reassigned on op %d",
                                                          opargsym(uselessop,0)->name(), opnum).c_str() : "");
         }
     }
@@ -1389,9 +1418,9 @@ RuntimeOptimizer::outparam_assign_elision (int opnum, Opcode &op)
         // replace its default value entirely and get rid of the assignment.
         if (R->firstread() > opnum && ! R->renderer_output() &&
                 m_opt_elide_unconnected_outputs) {
-            make_param_use_instanceval (R, Strutil::format("- written once, with a constant (%s), before any reads", const_value_as_string(*A)));
+            make_param_use_instanceval (R, Strutil::sprintf("- written once, with a constant (%s), before any reads", const_value_as_string(*A)));
             replace_param_value (R, A->data(), A->typespec());
-            turn_into_nop (op, debug() > 1 ? Strutil::format("oparam %s never subsequently read or connected", R->name().c_str()).c_str() : "");
+            turn_into_nop (op, debug() > 1 ? Strutil::sprintf("oparam %s never subsequently read or connected", R->name().c_str()).c_str() : "");
             return true;
         }
     }
@@ -1401,7 +1430,7 @@ RuntimeOptimizer::outparam_assign_elision (int opnum, Opcode &op)
     // assignment at all. Note that unread_after() does take into
     // consideration whether it's a renderer output.
     if (unread_after(R,opnum)) {
-        turn_into_nop (op, debug() > 1 ? Strutil::format("oparam %s never subsequently read or connected", R->name().c_str()).c_str() : "");
+        turn_into_nop (op, debug() > 1 ? Strutil::sprintf("oparam %s never subsequently read or connected", R->name().c_str()).c_str() : "");
         return true;
     }
 
@@ -1484,9 +1513,9 @@ RuntimeOptimizer::block_unalias (int symindex)
         i->second = -1;
     // In addition to the current block_aliases, unalias from any
     // saved alias lists.
-    for (size_t s = 0, send = m_block_aliases_stack.size(); s < send; ++s) {
-        FastIntMap::iterator i = m_block_aliases_stack[s]->find (symindex);
-        if (i != m_block_aliases_stack[s]->end())
+    for (auto& ba : m_block_aliases_stack) {
+        FastIntMap::iterator i = ba->find (symindex);
+        if (i != ba->end())
             i->second = -1;
     }
 }
@@ -1678,7 +1707,7 @@ RuntimeOptimizer::peephole2 (int opnum, int op2num)
               equivalent (a->typespec(), c->typespec())) {
             if (debug() > 1)
                 debug_opt_ops (opnum, opnum+1,
-                               Strutil::format ("turned '%s %s...' to '%s %s...' as part of daisy-chain",
+                               Strutil::sprintf ("turned '%s %s...' to '%s %s...' as part of daisy-chain",
                                  op.opname(), a->name(), op.opname(), c->name()));
             inst()->args()[op.firstarg()] = inst()->args()[next.firstarg()];
             c->mark_rw (opnum, false, true);
@@ -1757,10 +1786,10 @@ RuntimeOptimizer::mark_outgoing_connections ()
     ASSERT (! inst()->m_instoverrides.size() &&
             "don't call this before copy_code_from_master");
     inst()->outgoing_connections (false);
-    FOREACH_PARAM (Symbol &s, inst())
+    FOREACH_PARAM (auto&& s, inst())
         s.connected_down (false);
     for (int lay = layer()+1;  lay < group().nlayers();  ++lay) {
-        BOOST_FOREACH (Connection &c, group()[lay]->m_connections)
+        for (auto&& c : group()[lay]->m_connections)
             if (c.srclayer == layer()) {
                 inst()->symbol(c.src.param)->connected_down (true);
                 inst()->outgoing_connections (true);
@@ -1782,11 +1811,11 @@ RuntimeOptimizer::remove_unused_params ()
     SymNeverUsed param_never_used (*this, inst());  // handy predicate
 
     // Get rid of unused params' init ops and clear their read/write ranges
-    FOREACH_PARAM (Symbol &s, inst()) {
+    FOREACH_PARAM (auto&& s, inst()) {
         if (param_never_used(s) && s.has_init_ops()) {
             std::string why;
             if (debug() > 1)
-                why = Strutil::format ("remove init ops of unused param %s %s", s.typespec().c_str(), s.name());
+                why = Strutil::sprintf ("remove init ops of unused param %s %s", s.typespec().c_str(), s.name());
             turn_into_nop (s.initbegin(), s.initend(), why);
             s.set_initrange (0, 0);
             s.clear_rw();   // mark as totally unused
@@ -1823,7 +1852,7 @@ int
 RuntimeOptimizer::eliminate_middleman ()
 {
     int changed = 0;
-    FOREACH_PARAM (Symbol &s, inst()) {
+    FOREACH_PARAM (auto&& s, inst()) {
         // Skip if this isn't a shader output parameter that's connected
         // to a later layer.
         if (s.symtype() != SymTypeOutputParam || !s.connected_down())
@@ -2010,17 +2039,16 @@ RuntimeOptimizer::copy_block_aliases (const FastIntMap &old_block_aliases,
     // Find all symbols written anywhere in the instruction range
     new_block_aliases.clear ();
     new_block_aliases.reserve (old_block_aliases.size());
-    for (FastIntMap::const_iterator alias = old_block_aliases.begin();
-         alias != old_block_aliases.end();  ++alias) {
-        if (alias->second < 0)
+    for (auto&& oba : old_block_aliases) {
+        if (oba.second < 0)
             continue;    // erased alias -- don't copy
-        if (! copy_temps && (inst()->symbol(alias->first)->is_temp() ||
-                             inst()->symbol(alias->second)->is_temp()))
+        if (! copy_temps && (inst()->symbol(oba.first)->is_temp() ||
+                             inst()->symbol(oba.second)->is_temp()))
             continue;    // don't copy temp aliases unless told to
-        if (excluded && (excluded->find(alias->first) != excluded->end() ||
-                         excluded->find(alias->second) != excluded->end()))
+        if (excluded && (excluded->find(oba.first) != excluded->end() ||
+                         excluded->find(oba.second) != excluded->end()))
             continue;    // don't copy from excluded list
-        new_block_aliases[alias->first] = alias->second;
+        new_block_aliases[oba.first] = oba.second;
     }
 }
 
@@ -2105,9 +2133,11 @@ RuntimeOptimizer::optimize_ops (int beginop, int endop,
             if (op->argread(i))
                 use_stale_sym (oparg(*op,i));
         }
+
+        const OpDescriptor *opd = shadingsys().op_descriptor (op->opname());
         // If it's a simple assignment and the lvalue is "stale", go
         // back and eliminate its last assignment.
-        if (is_simple_assign(*op))
+        if (is_simple_assign(*op, opd))
             simple_sym_assign (oparg (*op, 0), opnum);
         // Make sure there's room for several more symbols, so that we
         // can add a few consts if we need to, without worrying about
@@ -2116,7 +2146,6 @@ RuntimeOptimizer::optimize_ops (int beginop, int endop,
         // For various ops that we know how to effectively
         // constant-fold, dispatch to the appropriate routine.
         if (optimize() >= 2 && m_opt_constant_fold) {
-            const OpDescriptor *opd = shadingsys().op_descriptor (op->opname());
             if (opd && opd->folder) {
                 int c = (*opd->folder) (*this, opnum);
                 if (c) {
@@ -2137,7 +2166,8 @@ RuntimeOptimizer::optimize_ops (int beginop, int endop,
         // Now we handle assignments.
         if (optimize() >= 2 && op->opname() == u_assign && m_opt_assign)
             changed += optimize_assignment (*op, opnum);
-        if (optimize() >= 2 && m_opt_elide_useless_ops)
+        if (optimize() >= 2 && m_opt_elide_useless_ops && opd
+            && !(opd->flags & OpDescriptor::SideEffects))
             changed += useless_op_elision (*op, opnum);
         if (m_stop_optimizing)
             break;
@@ -2224,7 +2254,7 @@ void
 RuntimeOptimizer::optimize_instance ()
 {
     // If "opt_layername" attribute is set, only optimize the named layer
-    if (shadingsys().m_opt_layername &&
+    if (!shadingsys().m_opt_layername.empty() &&
         shadingsys().m_opt_layername != inst()->layername())
         return;
 
@@ -2336,16 +2366,15 @@ RuntimeOptimizer::optimize_instance ()
         // Not needed.  Remove all its connections and ops.
         inst()->connections().clear ();
         turn_into_nop (0, (int)inst()->ops().size()-1,
-                       debug() > 1 ? Strutil::format("eliminate layer %s with no outward connections", inst()->layername().c_str()).c_str() : "");
-        BOOST_FOREACH (Symbol &s, inst()->symbols())
+                       debug() > 1 ? Strutil::sprintf("eliminate layer %s with no outward connections", inst()->layername().c_str()).c_str() : "");
+        for (auto&& s : inst()->symbols())
             s.clear_rw ();
     }
 
     // Now that we've optimized this layer, walk through the ops and
     // note which messages may have been sent, so subsequent layers will
     // know.
-    for (int opnum = 0, e = (int)inst()->ops().size();  opnum < e;   ++opnum) {
-        Opcode &op (inst()->ops()[opnum]);
+    for (auto& op : inst()->ops()) {
         if (op.opname() == u_setmessage) {
             Symbol &Name (*inst()->argsymbol(op.firstarg()+0));
             if (Name.is_constant())
@@ -2361,8 +2390,7 @@ RuntimeOptimizer::optimize_instance ()
 void
 RuntimeOptimizer::resolve_isconnected ()
 {
-    for (int i = 0, n = (int)inst()->ops().size();  i < n;  ++i) {
-        Opcode &op (inst()->ops()[i]);
+    for (auto& op : inst()->ops()) {
         if (op.opname() == u_isconnected) {
             inst()->make_symbol_room (1);
             SymbolPtr s = inst()->argsymbol (op.firstarg() + 1);
@@ -2396,7 +2424,7 @@ RuntimeOptimizer::track_variable_lifetimes (const SymbolPtrVec &allsymptrs)
 {
     SymbolPtrVec oparg_ptrs;
     oparg_ptrs.reserve (inst()->args().size());
-    BOOST_FOREACH (int a, inst()->args())
+    for (auto&& a : inst()->args())
         oparg_ptrs.push_back (inst()->symbol (a));
 
     if (m_bblockids.size() != inst()->ops().size())
@@ -2413,7 +2441,7 @@ RuntimeOptimizer::track_variable_lifetimes ()
 {
     SymbolPtrVec allsymptrs;
     allsymptrs.reserve (inst()->symbols().size());
-    BOOST_FOREACH (Symbol &s, inst()->symbols())
+    for (auto&& s : inst()->symbols())
         allsymptrs.push_back (&s);
 
     track_variable_lifetimes (allsymptrs);
@@ -2433,7 +2461,7 @@ RuntimeOptimizer::add_dependency (SymDependency &dmap, int A, int B)
 
 #ifdef DEBUG_SYMBOL_DEPENDENCIES
     // Unification -- make all of B's dependencies be dependencies of A.
-    BOOST_FOREACH (int r, dmap[B])
+    for (auto&& r : dmap[B])
         dmap[A].insert (r);
 #endif
 }
@@ -2466,7 +2494,7 @@ static const int DerivSym = -1;
 void
 RuntimeOptimizer::mark_symbol_derivatives (SymDependency &symdeps, SymIntSet &visited, int d)
 {
-    BOOST_FOREACH (int r, symdeps[d]) {
+    for (auto&& r : symdeps[d]) {
         if (visited.find(r) == visited.end()) {
             visited.insert(r);
             
@@ -2525,7 +2553,7 @@ RuntimeOptimizer::track_variable_dependencies ()
     std::vector<int> read, written;
     bool forcederivs = shadingsys().force_derivs();
     // Loop over all ops...
-    BOOST_FOREACH (Opcode &op, inst()->ops()) {
+    for (auto&& op : inst()->ops()) {
         // Gather the list of syms read and written by the op.  Reuse the
         // vectors defined outside the loop to cut down on malloc/free.
         read.clear ();
@@ -2536,10 +2564,10 @@ RuntimeOptimizer::track_variable_dependencies ()
         // or write to globals without them needing to be arguments.
 
         // For each symbol w written by the op...
-        BOOST_FOREACH (int w, written) {
+        for (auto&& w : written) {
             // For each symbol r read by the op, make w depend on r.
             // (Unless r is a constant , in which case it's not necessary.)
-            BOOST_FOREACH (int r, read)
+            for (auto&& r : read)
                 if (inst()->symbol(r)->symtype() != SymTypeConst)
                     add_dependency (symdeps, w, r);
             // If the op takes derivs, make the pseudo-symbol DerivSym
@@ -2575,7 +2603,7 @@ RuntimeOptimizer::track_variable_dependencies ()
     // downstream connects to it and needs derivatives of that
     // connection.
     int snum = 0;
-    BOOST_FOREACH (Symbol &s, inst()->symbols()) {
+    for (auto&& s : inst()->symbols()) {
         // Globals that get written should always provide derivs.
         // Exclude N, since its derivs are unreliable anyway, so no point
         // making it cause the whole disp shader to need derivs.
@@ -2592,7 +2620,7 @@ RuntimeOptimizer::track_variable_dependencies ()
     mark_symbol_derivatives (symdeps, visited, DerivSym);
 
     // Only some globals are allowed to have derivatives
-    BOOST_FOREACH (Symbol &s, inst()->symbols()) {
+    for (auto&& s : inst()->symbols()) {
         if (s.symtype() == SymTypeGlobal &&
             ! (s.mangled() == Strings::P ||
                s.mangled() == Strings::I ||
@@ -2607,12 +2635,12 @@ RuntimeOptimizer::track_variable_dependencies ()
 
     std::cerr << "track_variable_dependencies\n";
     std::cerr << "\nDependencies:\n";
-    BOOST_FOREACH (SymDependency::value_type &m, symdeps) {
+    for (auto&& m : symdeps) {
         if (m.first == DerivSym)
             std::cerr << "$derivs depends on ";
         else
             std::cerr << inst->symbol(m.first)->mangled() << " depends on ";
-        BOOST_FOREACH (int d, m.second) {
+        for (auto&& d : m.second) {
             if (d == DerivSym)
                 std::cerr << "$derivs ";
             else
@@ -2624,17 +2652,17 @@ RuntimeOptimizer::track_variable_dependencies ()
 
     // Invert the dependency
     SymDependency influences;
-    BOOST_FOREACH (SymDependency::value_type &m, symdeps)
-        BOOST_FOREACH (int d, m.second)
+    for (auto&& m : symdeps)
+        for (auto&& d : m.second)
             influences[d].insert (m.first);
 
     std::cerr << "\nReverse dependencies:\n";
-    BOOST_FOREACH (SymDependency::value_type &m, influences) {
+    for (auto&& m : influences) {
         if (m.first == DerivSym)
             std::cerr << "$derivs contrbutes to ";
         else
             std::cerr << inst->symbol(m.first)->mangled() << " contributes to ";
-        BOOST_FOREACH (int d, m.second) {
+        for (auto&& d : m.second) {
             if (d == DerivSym)
                 std::cerr << "$derivs ";
             else
@@ -2717,7 +2745,7 @@ RuntimeOptimizer::coalesce_temporaries ()
 
     // Since we may have aliased temps, now we need to make sure all
     // symbol refs are dealiased.
-    BOOST_FOREACH (int &arg, inst()->args()) {
+    for (auto&& arg : inst()->args()) {
         Symbol *s = inst()->symbol(arg);
         s = s->dealias ();
         arg = s - inst()->symbol(0);
@@ -2736,7 +2764,7 @@ RuntimeOptimizer::post_optimize_instance ()
 
     SymbolPtrVec allsymptrs;
     allsymptrs.reserve (inst()->symbols().size());
-    BOOST_FOREACH (Symbol &s, inst()->symbols())
+    for (auto&& s : inst()->symbols())
         allsymptrs.push_back (&s);
 
     m_bblockids.clear ();       // Keep insert_code from getting confused
@@ -2768,7 +2796,7 @@ RuntimeOptimizer::collapse_syms ()
     SymNeverUsed never_used (*this, inst());  // handy predicate
 
     // First, just count how many we need and set up the mapping
-    BOOST_FOREACH (const Symbol &s, inst()->symbols()) {
+    for (auto&& s : inst()->symbols()) {
         symbol_remap.push_back (total_syms);
         if (! never_used (s))
             ++total_syms;
@@ -2776,22 +2804,22 @@ RuntimeOptimizer::collapse_syms ()
 
     // Now make a new table of the right (new) size, and copy the used syms
     new_symbols.reserve (total_syms);
-    BOOST_FOREACH (const Symbol &s, inst()->symbols()) {
+    for (auto&& s : inst()->symbols()) {
         if (! never_used (s))
             new_symbols.push_back (s);
     }
 
     // Remap all the function arguments to the new indices
-    BOOST_FOREACH (int &arg, inst()->m_instargs)
+    for (auto&& arg : inst()->m_instargs)
         arg = symbol_remap[arg];
 
     // Fix our connections from upstream shaders
-    BOOST_FOREACH (Connection &c, inst()->m_connections)
+    for (auto&& c : inst()->m_connections)
         c.dst.param = symbol_remap[c.dst.param];
 
     // Fix downstream connections that reference us
     for (int lay = layer()+1;  lay < group().nlayers();  ++lay) {
-        BOOST_FOREACH (Connection &c, group()[lay]->m_connections)
+        for (auto&& c : group()[lay]->m_connections)
             if (c.srclayer == layer())
                 c.src.param = symbol_remap[c.src.param];
     }
@@ -2815,7 +2843,7 @@ RuntimeOptimizer::collapse_syms ()
     inst()->m_firstparam = -1;
     inst()->m_lastparam = -1;
     int i = 0;
-    BOOST_FOREACH (Symbol &s, inst()->symbols()) {
+    for (auto&& s : inst()->symbols()) {
         if (s.symtype() == SymTypeParam || s.symtype() == SymTypeOutputParam) {
             if (inst()->m_firstparam < 0)
                 inst()->m_firstparam = i;
@@ -2850,7 +2878,7 @@ RuntimeOptimizer::collapse_ops ()
     int total_ops = 0;              // number of new ops we'll need
 
     // First, just count how many we need and set up the mapping
-    BOOST_FOREACH (const Opcode &op, inst()->ops()) {
+    for (auto&& op : inst()->ops()) {
         op_remap.push_back (total_ops);
         if (op.opname() != u_nop)
             ++total_ops;
@@ -2859,7 +2887,7 @@ RuntimeOptimizer::collapse_ops ()
     // Now make a new table of the right (new) size, copy the used ops, and
     // reset the jump addresses.
     new_ops.reserve (total_ops);
-    BOOST_FOREACH (const Opcode &op, inst()->ops()) {
+    for (auto&& op : inst()->ops()) {
         if (op.opname() != u_nop) {
             new_ops.push_back (op);
             Opcode &newop (new_ops.back());
@@ -2872,7 +2900,7 @@ RuntimeOptimizer::collapse_ops ()
     // Adjust 'main' code range and init op ranges
     inst()->m_maincodebegin = op_remap[inst()->m_maincodebegin];
     inst()->m_maincodeend = (int)new_ops.size();
-    FOREACH_PARAM (Symbol &s, inst()) {
+    FOREACH_PARAM (auto&& s, inst()) {
         if (s.has_init_ops()) {
             s.initbegin (op_remap[s.initbegin()]);
             if (s.initend() < (int)op_remap.size())
@@ -2948,7 +2976,7 @@ RuntimeOptimizer::printinst (std::ostream &out) const
             if (op.jump(j) >= 0)
                 out << " " << op.jump(j);
         out << "\t# ";
-//        out << "    rw " << Strutil::format("%x",op.argread_bits())
+//        out << "    rw " << Strutil::sprintf("%x",op.argread_bits())
 //            << ' ' << op.argwrite_bits();
         if (op.argtakesderivs_all())
             out << " %derivs(" << op.argtakesderivs_all() << ") ";
@@ -3059,7 +3087,7 @@ RuntimeOptimizer::run ()
 
         // For our parameters that require derivatives, mark their
         // upstream connections as also needing derivatives.
-        BOOST_FOREACH (Connection &c, inst()->m_connections) {
+        for (auto&& c : inst()->m_connections) {
             if (inst()->symbol(c.dst.param)->has_derivs()) {
                 Symbol *source = group()[c.srclayer]->symbol(c.src.param);
                 if (! source->typespec().is_closure_based() &&
@@ -3105,6 +3133,8 @@ RuntimeOptimizer::run ()
     m_unknown_attributes_needed = false;
     m_textures_needed.clear();
     m_closures_needed.clear();
+    m_globals_read = 0;
+    m_globals_write = 0;
     m_globals_needed.clear();
     m_userdata_needed.clear();
     m_attributes_needed.clear();
@@ -3119,7 +3149,8 @@ RuntimeOptimizer::run ()
             // Find interpolated parameters
             if ((s.symtype() == SymTypeParam || s.symtype() == SymTypeOutputParam)
                 && ! s.lockgeom()) {
-                UserDataNeeded udn (s.name(), s.typespec().simpletype(), s.has_derivs());
+                UserDataNeeded udn (s.name(), layer, s.typespec().simpletype(),
+                                    s.data(), s.has_derivs());
                 std::set<UserDataNeeded>::iterator found;
                 found = m_userdata_needed.find (udn);
                 if (found == m_userdata_needed.end())
@@ -3132,11 +3163,16 @@ RuntimeOptimizer::run ()
             // Track which globals the group needs
             if (s.symtype() == SymTypeGlobal) {
                 m_globals_needed.insert (s.name());
+                int bit = int(ShadingSystem::globals_bit (s.name()));
+                if (s.everread())
+                    m_globals_read |= bit;
+                if (s.everwritten())
+                    m_globals_write |= bit;
             }
             if (s.has_derivs())
                 ++new_deriv_syms;
         }
-        BOOST_FOREACH (const Opcode &op, inst()->ops()) {
+        for (auto&& op : inst()->ops()) {
             const OpDescriptor *opd = shadingsys().op_descriptor (op.opname());
             if (! opd)
                 continue;
@@ -3222,20 +3258,20 @@ RuntimeOptimizer::run ()
             shadingcontext()->info ("Group does nothing");
         if (m_textures_needed.size()) {
             shadingcontext()->info ("Group needs textures:");
-            BOOST_FOREACH (ustring f, m_textures_needed)
+            for (auto&& f : m_textures_needed)
                 shadingcontext()->info ("    %s", f);
             if (m_unknown_textures_needed)
                 shadingcontext()->info ("    Also may construct texture names on the fly.");
         }
         if (m_userdata_needed.size()) {
             shadingcontext()->info ("Group potentially needs userdata:");
-            BOOST_FOREACH (UserDataNeeded f, m_userdata_needed)
+            for (auto&& f : m_userdata_needed)
                 shadingcontext()->info ("    %s %s %s", f.name, f.type,
                                         f.derivs ? "(derivs)" : "");
         }
         if (m_attributes_needed.size()) {
             shadingcontext()->info ("Group needs attributes:");
-            BOOST_FOREACH (const AttributeNeeded &f, m_attributes_needed)
+            for (auto&& f : m_attributes_needed)
                 shadingcontext()->info ("    %s %s", f.name, f.scope);
             if (m_unknown_attributes_needed)
                 shadingcontext()->info ("    Also may construct attribute names on the fly.");
@@ -3243,6 +3279,67 @@ RuntimeOptimizer::run ()
     }
 }
 
+
+
+bool
+RuntimeOptimizer::police(const Opcode& op, string_view msg, int type)
+{
+    if ((type & police_gpu_err) && shadingsys().m_gpu_opt_error) {
+        shadingcontext()->error ("Optimization error for GPUs:\n"
+                                 "  group:  %s\n"
+                                 "  layer:  %s\n"
+                                 "  source: %s:%d\n"
+                                 "  issue:  %s",
+                                 group().name(), inst()->layername(),
+                                 op.sourcefile(), op.sourceline(), msg);
+        return true;
+    } else if ((type & police_opt_warn) && shadingsys().m_opt_warnings) {
+        shadingcontext()->warning ("Optimization warning:\n"
+                                 "  group:  %s\n"
+                                 "  layer:  %s\n"
+                                 "  source: %s:%d\n"
+                                 "  issue:  %s",
+                                 group().name(), inst()->layername(),
+                                 op.sourcefile(), op.sourceline(), msg);
+    }
+    return false;
+}
+
+
+
+bool
+RuntimeOptimizer::police_failed_optimizations()
+{
+    using OIIO::Strutil::format;
+    bool err = false;
+    bool do_warn = shadingsys().m_opt_warnings;
+    bool do_gpu_err = shadingsys().m_gpu_opt_error;
+    if (!do_warn && !do_gpu_err)
+        return false;  // no need for any of this expense
+
+    int nlayers = (int) group().nlayers ();
+    for (int layer = 0;  layer < nlayers;  ++layer) {
+        set_inst (layer);
+        if (inst()->unused())
+            continue;  // no need to print or gather stats for unused layers
+        for (auto&& op : inst()->ops()) {
+            const OpDescriptor *opd = shadingsys().op_descriptor (op.opname());
+            if (! opd)
+                continue;
+            if (opd->flags & OpDescriptor::Tex) {
+                Symbol *sym = opargsym (op, 1);  // arg 1 is texture name
+                DASSERT (sym && sym->typespec().is_string());
+                if (! sym->is_constant()) {
+                    err |= police (op, format("%s(): texture name cannot be reduced to a constant.",
+                                              op.opname()),
+                                   police_gpu_err);
+                }
+            }
+            // FIXME: Will add more tests and warnings as we go
+        }
+    }
+    return err;
+}
 
 }; // namespace pvt
 OSL_NAMESPACE_EXIT

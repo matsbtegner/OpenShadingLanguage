@@ -65,8 +65,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /// dependencies, and so what is exported for one may be imported for
 /// another.
 
-#if defined(_MSC_VER) || defined(__CYGWIN__)
-  #if defined(OSL_STATIC_LIBRARY)
+#if defined(_WIN32) || defined(__CYGWIN__)
+  #if defined(OSL_STATIC_BUILD)
     #define OSL_DLL_IMPORT
     #define OSL_DLL_EXPORT
     #define OSL_DLL_LOCAL
@@ -75,23 +75,18 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
     #define OSL_DLL_EXPORT __declspec(dllexport)
     #define OSL_DLL_LOCAL
   #endif
-  #define OSL_LLVM_EXPORT __declspec(dllexport)
+  //#define OSL_LLVM_EXPORT __declspec(dllexport)
+  #define OSL_LLVM_EXPORT OSL_DLL_LOCAL
 #else
-  #if (10000*__GNUC__ + 100*__GNUC_MINOR__ + __GNUC_PATCHLEVEL__) > 40102
-    #define OSL_DLL_IMPORT __attribute__ ((visibility ("default")))
-    #define OSL_DLL_EXPORT __attribute__ ((visibility ("default")))
-    #define OSL_DLL_LOCAL  __attribute__ ((visibility ("hidden")))
-  #else
-    #define OSL_DLL_IMPORT
-    #define OSL_DLL_EXPORT
-    #define OSL_DLL_LOCAL
-  #endif
-  #define OSL_LLVM_EXPORT OSL_DLL_EXPORT
+  #define OSL_DLL_IMPORT __attribute__ ((visibility ("default")))
+  #define OSL_DLL_EXPORT __attribute__ ((visibility ("default")))
+  #define OSL_DLL_LOCAL  __attribute__ ((visibility ("hidden")))
+  #define OSL_LLVM_EXPORT OSL_DLL_LOCAL
 #endif
 
 
 
-#if defined(oslcomp_EXPORTS)
+#if defined(oslcomp_EXPORTS) || defined(oslexec_EXPORTS)
 #  define OSLCOMPPUBLIC OSL_DLL_EXPORT
 #else
 #  define OSLCOMPPUBLIC OSL_DLL_IMPORT
@@ -107,4 +102,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #  define OSLQUERYPUBLIC OSL_DLL_EXPORT
 #else
 #  define OSLQUERYPUBLIC OSL_DLL_IMPORT
+#endif
+
+#if defined(oslnoise_EXPORTS) || defined(oslexec_EXPORTS)
+#  define OSLNOISEPUBLIC OSL_DLL_EXPORT
+#else
+#  define OSLNOISEPUBLIC OSL_DLL_IMPORT
 #endif

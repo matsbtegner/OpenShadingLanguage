@@ -28,8 +28,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
-#include "export.h"
-#include "oslversion.h"
+#include <OSL/export.h>
+#include <OSL/oslversion.h>
+#include <OSL/oslconfig.h>
 
 #include <vector>
 
@@ -43,15 +44,13 @@ namespace llvm {
   class ExecutionEngine;
   class Function;
   class FunctionType;
-  class JITMemoryManager;
+  class SectionMemoryManager;
   class Linker;
   class LLVMContext;
   class Module;
   class PointerType;
   class Type;
   class Value;
-  template<bool preserveNames, typename T, typename Inserter> class IRBuilder;
-  template<bool preserveNames> class IRBuilderDefaultInserter;
   namespace legacy {
     class FunctionPassManager;
     class PassManager;
@@ -65,7 +64,6 @@ OSL_NAMESPACE_ENTER
 namespace pvt {   // OSL::pvt
 
 
-class OSL_Dummy_JITMemoryManager;
 
 
 
@@ -79,8 +77,6 @@ public:
     ~LLVM_Util ();
 
     struct PerThreadInfo;
-    typedef llvm::IRBuilder<true,llvm::ConstantFolder,
-                            llvm::IRBuilderDefaultInserter<true> > IRBuilder;
 
     /// Set debug level
     void debug (int d) { m_debug = d; }
@@ -126,6 +122,10 @@ public:
                                    const std::vector<llvm::Type*> &paramtypes,
                                    bool varargs=false);
 
+    /// Add a global mapping of a function to its callable address
+    /// explicitly instead of relying on dlsym.
+    void add_function_mapping (llvm::Function *func, void *addr);
+
     /// Set up a new current function that subsequent basic blocks will
     /// be added to.
     void current_function (llvm::Function *func) { m_current_function = func; }
@@ -144,14 +144,6 @@ public:
 
     /// End the current builder
     void end_builder ();
-
-    /// Return the current IR builder, create a new one (for the current
-    /// function) if necessary.
-    IRBuilder &builder () {
-        if (! m_builder)
-            new_builder ();
-        return *m_builder;
-    }
 
     /// Create a new JITing ExecutionEngine and make it the current one.
     /// Return a pointer to the new engine.  If err is not NULL, put any
@@ -183,7 +175,7 @@ public:
     void setup_optimization_passes (int optlevel);
 
     /// Run the optimization passes.
-    void do_optimize ();
+    void do_optimize (std::string *err = NULL);
 
     /// Retrieve a callable pointer to the JITed version of a function.
     /// This will JIT the function if it hasn't already done so. Be sure
@@ -241,8 +233,10 @@ public:
     llvm::PointerType *type_char_ptr() const { return m_llvm_type_char_ptr; }
     llvm::PointerType *type_int_ptr() const { return m_llvm_type_int_ptr; }
     llvm::PointerType *type_float_ptr() const { return m_llvm_type_float_ptr; }
+    llvm::PointerType *type_longlong_ptr() const { return m_llvm_type_longlong_ptr; }
     llvm::PointerType *type_triple_ptr() const { return m_llvm_type_triple_ptr; }
     llvm::PointerType *type_matrix_ptr() const { return m_llvm_type_matrix_ptr; }
+    llvm::PointerType *type_double_ptr() const { return m_llvm_type_double_ptr; }
 
     /// Generate the appropriate llvm type definition for a TypeDesc
     /// (this is the actual type, for example when we allocate it).
@@ -305,10 +299,7 @@ public:
 
     /// Return an llvm::Value holding the given string constant.
     llvm::Value *constant (OIIO::ustring s);
-    llvm::Value *constant (const char *s) {
-        return constant(OIIO::ustring(s));
-    }
-    llvm::Value *constant (const std::string &s) {
+    llvm::Value *constant (OIIO::string_view s) {
         return constant(OIIO::ustring(s));
     }
 
@@ -333,6 +324,10 @@ public:
     /// Cast the pointer variable specified by val to a pointer to the given
     /// data type, return the llvm::Value of the new pointer.
     llvm::Value *ptr_cast (llvm::Value* val, const OIIO::TypeDesc &type);
+
+    /// Cast the variable specified by val to a pointer of type void*,
+    /// return the llvm::Value of the new pointer.
+    llvm::Value *int_to_ptr_cast (llvm::Value* val);
 
     /// Cast the pointer variable specified by val to a pointer of type
     /// void* return the llvm::Value of the new pointer.
@@ -360,36 +355,27 @@ public:
     /// Generate code for a call to the function pointer, with the given
     /// arg list.  Return an llvm::Value* corresponding to the return
     /// value of the function, if any.
-    llvm::Value *call_function (llvm::Value *func,
-                                llvm::Value **args, int nargs);
+    llvm::Value *call_function (llvm::Value *func, cspan<llvm::Value *> args);
     /// Generate code for a call to the named function with the given arg
     /// list.  Return an llvm::Value* corresponding to the return value of
     /// the function, if any.
-    llvm::Value *call_function (const char *name,
-                                llvm::Value **args, int nargs);
-    template<size_t N>
-    llvm::Value* call_function (const char *name, llvm::Value* (&args)[N]) {
-        return call_function (name, &args[0], int(N));
-    }
+    llvm::Value *call_function (const char *name, cspan<llvm::Value *> args);
 
     llvm::Value *call_function (const char *name, llvm::Value *arg0) {
-        return call_function (name, &arg0, 1);
+        return call_function (name, cspan<llvm::Value*>(&arg0, 1));
     }
     llvm::Value *call_function (const char *name, llvm::Value *arg0,
                                 llvm::Value *arg1) {
-        llvm::Value *args[2] = { arg0, arg1 };
-        return call_function (name, args, 2);
+        return call_function (name, { arg0, arg1 });
     }
     llvm::Value *call_function (const char *name, llvm::Value *arg0,
                                 llvm::Value *arg1, llvm::Value *arg2) {
-        llvm::Value *args[3] = { arg0, arg1, arg2 };
-        return call_function (name, args, 3);
+        return call_function (name, { arg0, arg1, arg2 });
     }
     llvm::Value *call_function (const char *name, llvm::Value *arg0,
                                 llvm::Value *arg1, llvm::Value *arg2,
                                 llvm::Value *arg3) {
-        llvm::Value *args[4] = { arg0, arg1, arg2, arg3 };
-        return call_function (name, args, 4);
+        return call_function (name, { arg0, arg1, arg2, arg3 });
     }
 
     /// Mark the function call (which MUST be the value returned by a
@@ -421,6 +407,10 @@ public:
 
     /// Generate code for a memcpy.
     void op_memcpy (llvm::Value *dst, llvm::Value *src, int len, int align=1);
+
+    /// Generate code for a memcpy.
+    void op_memcpy (llvm::Value *dst, int dstalign,
+                    llvm::Value *src, int srcalign, int len);
 
     /// Dereference a pointer:  return *ptr
     llvm::Value *op_load (llvm::Value *ptr);
@@ -460,6 +450,7 @@ public:
     llvm::Value *op_int_to_float (llvm::Value *a);
     llvm::Value *op_bool_to_int (llvm::Value *a);
     llvm::Value *op_float_to_double (llvm::Value *a);
+    llvm::Value *op_int_to_longlong (llvm::Value *a);
 
     llvm::Value *op_and (llvm::Value *a, llvm::Value *b);
     llvm::Value *op_or (llvm::Value *a, llvm::Value *b);
@@ -486,7 +477,14 @@ public:
     /// file.  If err is not NULL, errors will be deposited there.
     void write_bitcode_file (const char *filename, std::string *err=NULL);
 
-    /// Convert a function's bitcode to a string.
+    /// Generate PTX for the current Module and return it as a string
+    bool ptx_compile_group (llvm::Module* lib_module, const std::string& name,
+                            std::string& out);
+
+    /// Convert a whole module's bitcode to a string.
+    std::string bitcode_string (llvm::Module *module);
+
+    /// Convert one function's bitcode to a string.
     std::string bitcode_string (llvm::Function *func);
 
     /// Delete the IR for the body of the given function to reclaim its
@@ -501,20 +499,18 @@ public:
     static size_t total_jit_memory_held ();
 
 private:
-    /// Return a pointer to the JIT memory manager.
-    llvm::JITMemoryManager *jitmm () const {
-        return (llvm::JITMemoryManager *)m_llvm_jitmm;
-    }
+    class MemoryManager;
+    class IRBuilder;
 
     void SetupLLVM ();
-
+    IRBuilder& builder();
 
     int m_debug;
     PerThreadInfo *m_thread;
     llvm::LLVMContext *m_llvm_context;
     llvm::Module *m_llvm_module;
     IRBuilder *m_builder;
-    OSL_Dummy_JITMemoryManager *m_llvm_jitmm;
+    llvm::SectionMemoryManager *m_llvm_jitmm;
     llvm::Function *m_current_function;
     llvm::legacy::PassManager *m_llvm_module_passes;
     llvm::legacy::FunctionPassManager *m_llvm_func_passes;
@@ -537,8 +533,10 @@ private:
     llvm::PointerType *m_llvm_type_char_ptr;
     llvm::PointerType *m_llvm_type_int_ptr;
     llvm::PointerType *m_llvm_type_float_ptr;
+    llvm::PointerType *m_llvm_type_longlong_ptr;
     llvm::PointerType *m_llvm_type_triple_ptr;
     llvm::PointerType *m_llvm_type_matrix_ptr;
+    llvm::PointerType *m_llvm_type_double_ptr;
 
 };
 

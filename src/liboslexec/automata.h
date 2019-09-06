@@ -32,11 +32,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <map>
 #include <list>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
-#include <boost/unordered_map.hpp>
-#include <boost/unordered_set.hpp>
-
-#include "OSL/oslconfig.h"
+#include <OSL/oslconfig.h>
 
 
 OSL_NAMESPACE_ENTER
@@ -47,13 +46,13 @@ OSL_NAMESPACE_ENTER
 // General container for integer sets
 typedef std::set<int> IntSet; // probably faster to test for equality, unions and so
 
-typedef boost::unordered_set<ustring, ustringHash> SymbolSet;
+typedef std::unordered_set<ustring, ustringHash> SymbolSet;
 // This is for the transition table used in DfAutomata::State
-typedef boost::unordered_map<ustring, int, ustringHash> SymbolToInt;
+typedef std::unordered_map<ustring, int, ustringHash> SymbolToInt;
 // And this is for the transition table in NdfAutomata which
 // has several movements for each symbol
-typedef boost::unordered_map<ustring, IntSet, ustringHash> SymbolToIntList;
-typedef boost::unordered_map<int, int> HashIntInt;
+typedef std::unordered_map<ustring, IntSet, ustringHash> SymbolToIntList;
+typedef std::unordered_map<int, int> HashIntInt;
 
 // For the rules in the deterministic states, we don't need a real set
 // cause when converting from the NDF automata we will never find the same
@@ -176,7 +175,7 @@ class NdfAutomata {
 
         /// Get the set of states that are reachable from the given state set using the given symbol
         void transitionsFrom(const IntSet &states, ustring symbol, IntSet &out_states)const;
-        /// Get the set of states that are reachable from the given state set by lambda
+        /// Get the set of states that are reachable from the given state set by wildcard
         void wildcardTransitionsFrom(const IntSet &states, IntSet &out_states)const;
 
         /// Perform a lambda closure of a state set

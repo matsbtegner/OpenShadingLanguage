@@ -36,8 +36,12 @@ using namespace OSL;
 using namespace OSL::pvt;
 
 #include "runtimeoptimize.h"
-#include "OSL/llvm_util.h"
+#include <OSL/llvm_util.h>
 
+// additional includes for creating global OptiX variables
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Module.h"
 
 
 OSL_NAMESPACE_ENTER
@@ -85,7 +89,7 @@ public:
 
     typedef std::map<std::string, llvm::Value*> AllocationMap;
 
-    void llvm_assign_initial_value (const Symbol& sym);
+    void llvm_assign_initial_value (const Symbol& sym, bool force = false);
     llvm::LLVMContext &llvm_context () const { return ll.context(); }
     AllocationMap &named_values () { return m_named_values; }
 
@@ -139,7 +143,17 @@ public:
     llvm::Value *llvm_load_value (const Symbol& sym, int deriv = 0,
                                   int component = 0,
                                   TypeDesc cast=TypeDesc::UNKNOWN) {
-        return llvm_load_value (sym, deriv, NULL, component, cast);
+        return (use_optix() && ! sym.typespec().is_closure() && sym.typespec().is_string()) ? llvm_load_device_string(sym) : llvm_load_value (sym, deriv, NULL, component, cast);
+    }
+
+    /// Load the address of a global device-side string pointer, which may
+    /// reside in a global variable, the groupdata struct, or a local value.
+    llvm::Value *llvm_load_device_string (const Symbol& sym);
+
+    /// Convenience function to load a string for CPU or GPU device
+    llvm::Value *llvm_load_string (const Symbol& sym) {
+        DASSERT(sym.typespec().is_string());
+        return use_optix() ? llvm_load_device_string(sym) : llvm_load_value(sym);
     }
 
     /// Legacy version
@@ -211,6 +225,26 @@ public:
     /// map, the symbol is alloca'd and placed in the map.
     llvm::Value *getOrAllocateLLVMSymbol (const Symbol& sym);
 
+    /// Allocate a CUDA variable for the given OSL symbol and return a pointer
+    /// to the corresponding LLVM GlobalVariable, or return the pointer if it
+    /// has already been allocated.
+    llvm::Value *getOrAllocateCUDAVariable (const Symbol& sym);
+
+    /// Create a CUDA global variable and add it to the current Module
+    llvm::Value *addCUDAVariable (const std::string& name, int size,
+                                  int alignment, void* data,
+                                  const std::string& type="");
+
+    /// Create a CUDA variable, along with the extra semantic information needed
+    /// by OptiX.
+    llvm::Value *createOptixVariable (const std::string& name,
+                                      const std::string& type,
+                                      int size, void* data );
+
+    /// Create the extra semantic information needed for OptiX variables
+    void createOptixMetadata (const std::string& name,
+                              const std::string& type, int size );
+
     /// Retrieve an llvm::Value that is a pointer holding the start address
     /// of the specified symbol. This always works for globals and params;
     /// for stack variables (locals/temps) is succeeds only if the symbol is
@@ -229,7 +263,8 @@ public:
 
     /// Implementaiton of Simple assignment.  If arrayindex >= 0, in
     /// designates a particular array index to assign.
-    bool llvm_assign_impl (Symbol &Result, Symbol &Src, int arrayindex = -1);
+    bool llvm_assign_impl (Symbol &Result, Symbol &Src, int arrayindex = -1,
+                           int srcomp = -1, int dstcomp = -1);
 
 
     /// Convert the name of a global (and its derivative index) into the
@@ -313,13 +348,13 @@ public:
     void llvm_zero_derivs (const Symbol &sym, llvm::Value *count);
 
     /// Generate a debugging printf at shader execution time.
-    void llvm_gen_debug_printf (const std::string &message);
+    void llvm_gen_debug_printf (string_view message);
 
     /// Generate a warning message at shader execution time.
-    void llvm_gen_warning (const std::string &message);
+    void llvm_gen_warning (string_view message);
 
     /// Generate an error message at shader execution time.
-    void llvm_gen_error (const std::string &message);
+    void llvm_gen_error (string_view message);
 
     /// Generate code to call the given layer.  If 'unconditional' is
     /// true, call it without even testing if the layer has already been
@@ -341,15 +376,21 @@ public:
     /// is true, pass pointers even for floats if they have derivs.
     /// Return an llvm::Value* corresponding to the return value of the
     /// function, if any.
-    llvm::Value *llvm_call_function (const char *name,  const Symbol **args,
-                                     int nargs, bool deriv_ptrs=false);
-    llvm::Value *llvm_call_function (const char *name, const Symbol &A,
+    llvm::Value *llvm_call_function (const char *name, cspan<const Symbol *> args,
                                      bool deriv_ptrs=false);
     llvm::Value *llvm_call_function (const char *name, const Symbol &A,
-                                     const Symbol &B, bool deriv_ptrs=false);
+                                     bool deriv_ptrs=false) {
+        return llvm_call_function (name, { &A }, deriv_ptrs);
+    }
+    llvm::Value *llvm_call_function (const char *name, const Symbol &A,
+                                     const Symbol &B, bool deriv_ptrs=false) {
+        return llvm_call_function (name, { &A, &B }, deriv_ptrs);
+    }
     llvm::Value *llvm_call_function (const char *name, const Symbol &A,
                                      const Symbol &B, const Symbol &C,
-                                     bool deriv_ptrs=false);
+                                     bool deriv_ptrs=false) {
+        return llvm_call_function (name, { &A, &B, &C }, deriv_ptrs);
+    }
 
     TypeDesc llvm_typedesc (const TypeSpec &typespec) {
         return typespec.is_closure_based()
@@ -381,7 +422,7 @@ public:
     ///
     llvm::BasicBlock *llvm_exit_instance_block () {
         if (! m_exit_instance_block) {
-            std::string name = Strutil::format ("%s_%d_exit_", inst()->layername(), inst()->id());
+            std::string name = Strutil::sprintf ("%s_%d_exit_", inst()->layername(), inst()->id());
             m_exit_instance_block = ll.new_basic_block (name);
         }
         return m_exit_instance_block;
@@ -391,6 +432,8 @@ public:
     void llvm_generate_debugnan (const Opcode &op);
     /// Check for uninitialized values in all read-from arguments to the op
     void llvm_generate_debug_uninit (const Opcode &op);
+    /// Print debugging line for the op
+    void llvm_generate_debug_op_printf (const Opcode &op);
 
     llvm::Function *layer_func () const { return ll.current_function(); }
 
@@ -400,6 +443,17 @@ public:
         if (handle)
             shadingsys().m_stat_tex_calls_as_handles += 1;
     }
+
+    /// Return the mapping from symbol names to GlobalVariables.
+    std::map<std::string,llvm::GlobalVariable*>& get_const_map() { return m_const_map; }
+
+    /// Return whether or not we are compiling for an OptiX-based renderer.
+    bool use_optix() { return m_use_optix; }
+
+    /// Return the userdata index for the given Symbol.  Return -1 if the Symbol
+    /// is not an input parameter or is constant and therefore doesn't have an
+    /// entry in the groupdata struct.
+    int find_userdata_index (const Symbol& sym);
 
     LLVM_Util ll;
 
@@ -426,6 +480,16 @@ private:
     llvm::PointerType *m_llvm_type_prepare_closure_func;
     llvm::PointerType *m_llvm_type_setup_closure_func;
     int m_llvm_local_mem;             // Amount of memory we use for locals
+
+    // A mapping from symbol names to llvm::GlobalVariables
+    std::map<std::string,llvm::GlobalVariable*> m_const_map;
+
+    // A mapping from canonical strings to string variable names, used to
+    // detect collisions that might occur due to using the string hash to
+    // create variable names.
+    std::map<std::string,std::string>           m_varname_map;
+
+    bool m_use_optix;                   ///< Compile for OptiX?
 
     friend class ShadingSystemImpl;
 };

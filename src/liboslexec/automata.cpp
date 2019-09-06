@@ -27,7 +27,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include "automata.h"
-#include "OSL/optautomata.h"
+#include <OSL/optautomata.h>
 #include <algorithm>
 #include <cstdio>
 
@@ -110,7 +110,7 @@ NdfAutomata::State::tostr()const
         for (IntSet::const_iterator j = dest.begin(); j != dest.end(); ++j) {
             if (s[s.size()-1] != '{')
                 s += ", ";
-            s += Strutil::format("%d", *j);
+            s += Strutil::sprintf("%d", *j);
         }
         s += "}";
     }
@@ -132,12 +132,12 @@ NdfAutomata::State::tostr()const
             }
             s += "]:";
         }
-        s += Strutil::format("%d", m_wildcard_trans);
+        s += Strutil::sprintf("%d", m_wildcard_trans);
     }
     // and finally the rule if we have it
     if (m_rule) {
         s += " | ";
-        s += Strutil::format("%lx", (long unsigned int)m_rule);
+        s += Strutil::sprintf("%lx", (long unsigned int)m_rule);
     }
     return s;
 }
@@ -361,7 +361,7 @@ DfAutomata::State::tostr()const
         else
             s += sym.c_str();
         s += ":";
-        s += Strutil::format("%d", dest);
+        s += Strutil::sprintf("%d", dest);
     }
     // wildcard
     if (m_wildcard_trans >= 0) {
@@ -379,7 +379,7 @@ DfAutomata::State::tostr()const
             }
             s += "}:";
         }
-        s += Strutil::format("%d", m_wildcard_trans);
+        s += Strutil::sprintf("%d", m_wildcard_trans);
     }
     // and the rules
     if (m_rules.size()) {
@@ -387,7 +387,7 @@ DfAutomata::State::tostr()const
         for (RuleSet::const_iterator i = m_rules.begin(); i != m_rules.end(); ++i) {
             if (s[s.size()-1] != '[')
                 s += ", ";
-            s += Strutil::format("%lx", (long unsigned int)*i);
+            s += Strutil::sprintf("%lx", (long unsigned int)*i);
         }
         s += "]";
     }
@@ -545,7 +545,7 @@ StateSetRecord::ensureState(const IntSet &newstates, std::list<StateSetRecord::D
         getRulesFromSet(tstate, m_ndfautomata, newstates);
         m_key_to_dfstate[newkey] = tstate;
         // Add the discovery to the list so it will be explored
-        discovered.push_back(Discovery(tstate, newstates));
+        discovered.emplace_back(tstate, newstates);
         return tstate;
     }
 }

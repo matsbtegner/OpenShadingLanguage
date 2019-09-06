@@ -38,8 +38,6 @@ using namespace OSL::pvt;
 #include <OpenImageIO/dassert.h>
 #include <OpenImageIO/filesystem.h>
 
-#include <boost/algorithm/string.hpp>
-
 
 OSL_NAMESPACE_ENTER
 
@@ -124,9 +122,9 @@ RendererServices::get_inverse_matrix (ShaderGlobals *sg, Matrix44 &result,
 
 
 RendererServices::TextureHandle *
-RendererServices::get_texture_handle (ustring filename)
+RendererServices::get_texture_handle (ustring filename, ShadingContext *context)
 {
-    return texturesys()->get_texture_handle (filename);
+    return texturesys()->get_texture_handle (filename, context->texture_thread_info());
 }
 
 
@@ -134,24 +132,8 @@ RendererServices::get_texture_handle (ustring filename)
 bool
 RendererServices::good (TextureHandle *texture_handle)
 {
-#if OIIO_VERSION >= 10602
     return texturesys()->good (texture_handle);
-#else
-    // The good() query is not available for OIIO < 1.6.2, so just assume
-    // it's ok and hope for the best.
-    return true;
-#endif
 }
-
-
-
-RendererServices::TexturePerthread *
-RendererServices::get_texture_perthread (ShadingContext *context)
-{
-    return context ? context->texture_thread_info()
-                   : texturesys()->get_perthread_info();
-}
-
 
 
 bool
@@ -166,15 +148,11 @@ RendererServices::texture (ustring filename, TextureHandle *texture_handle,
     ShadingContext *context = sg->context;
     if (! texture_thread_info)
         texture_thread_info = context->texture_thread_info();
-    bool status;
-    if (texture_handle)
-        status = texturesys()->texture (texture_handle, texture_thread_info,
-                                        options, s, t, dsdx, dtdx, dsdy, dtdy,
-                                        nchannels, result, dresultds, dresultdt);
-    else
-        status = texturesys()->texture (filename,
-                                        options, s, t, dsdx, dtdx, dsdy, dtdy,
-                                        nchannels, result, dresultds, dresultdt);
+    if (! texture_handle)
+        texture_handle = texturesys()->get_texture_handle (filename, texture_thread_info);
+    bool status = texturesys()->texture (texture_handle, texture_thread_info,
+                                         options, s, t, dsdx, dtdx, dsdy, dtdy,
+                                         nchannels, result, dresultds, dresultdt);
     if (!status) {
         std::string err = texturesys()->geterror();
         if (err.size() && sg) {
@@ -185,38 +163,6 @@ RendererServices::texture (ustring filename, TextureHandle *texture_handle,
             }
         } else if (errormessage) {
             *errormessage = Strings::unknown;
-        }
-    }
-    return status;
-}
-
-
-
-// Deprecated version
-bool
-RendererServices::texture (ustring filename, TextureHandle *texture_handle,
-                           TexturePerthread *texture_thread_info,
-                           TextureOpt &options, ShaderGlobals *sg,
-                           float s, float t, float dsdx, float dtdx,
-                           float dsdy, float dtdy, int nchannels,
-                           float *result, float *dresultds, float *dresultdt)
-{
-    ShadingContext *context = sg->context;
-    if (! texture_thread_info)
-        texture_thread_info = context->texture_thread_info();
-    bool status;
-    if (texture_handle)
-        status = texturesys()->texture (texture_handle, texture_thread_info,
-                                        options, s, t, dsdx, dtdx, dsdy, dtdy,
-                                        nchannels, result, dresultds, dresultdt);
-    else
-        status = texturesys()->texture (filename,
-                                        options, s, t, dsdx, dtdx, dsdy, dtdy,
-                                        nchannels, result, dresultds, dresultdt);
-    if (!status) {
-        std::string err = texturesys()->geterror();
-        if (err.size() && sg) {
-            context->error ("[RendererServices::texture] %s", err);
         }
     }
     return status;
@@ -236,17 +182,13 @@ RendererServices::texture3d (ustring filename, TextureHandle *texture_handle,
     ShadingContext *context = sg->context;
     if (! texture_thread_info)
         texture_thread_info = context->texture_thread_info();
-    bool status;
-    if (texture_handle)
-        status = texturesys()->texture3d (texture_handle, texture_thread_info,
-                                          options, P, dPdx, dPdy, dPdz,
-                                          nchannels, result,
-                                          dresultds, dresultdt, dresultdr);
-    else
-        status = texturesys()->texture3d (filename,
-                                          options, P, dPdx, dPdy, dPdz,
-                                          nchannels, result,
-                                          dresultds, dresultdt, dresultdr);
+    if (! texture_handle)
+        texture_handle = texturesys()->get_texture_handle (filename, texture_thread_info);
+
+    bool status = texturesys()->texture3d (texture_handle, texture_thread_info,
+                                           options, P, dPdx, dPdy, dPdz,
+                                           nchannels, result,
+                                           dresultds, dresultdt, dresultdr);
     if (!status) {
         std::string err = texturesys()->geterror();
         if (err.size() && sg) {
@@ -257,40 +199,6 @@ RendererServices::texture3d (ustring filename, TextureHandle *texture_handle,
             }
         } else if (errormessage) {
             *errormessage = Strings::unknown;
-        }
-    }
-    return status;
-}
-
-
-
-// Deprecated version
-bool
-RendererServices::texture3d (ustring filename, TextureHandle *texture_handle,
-                             TexturePerthread *texture_thread_info,
-                             TextureOpt &options, ShaderGlobals *sg,
-                             const Vec3 &P, const Vec3 &dPdx, const Vec3 &dPdy,
-                             const Vec3 &dPdz, int nchannels, float *result,
-                             float *dresultds, float *dresultdt, float *dresultdr)
-{
-    ShadingContext *context = sg->context;
-    if (! texture_thread_info)
-        texture_thread_info = context->texture_thread_info();
-    bool status;
-    if (texture_handle)
-        status = texturesys()->texture3d (texture_handle, texture_thread_info,
-                                          options, P, dPdx, dPdy, dPdz,
-                                          nchannels, result,
-                                          dresultds, dresultdt, dresultdr);
-    else
-        status = texturesys()->texture3d (filename,
-                                          options, P, dPdx, dPdy, dPdz,
-                                          nchannels, result,
-                                          dresultds, dresultdt, dresultdr);
-    if (!status) {
-        std::string err = texturesys()->geterror();
-        if (err.size() && sg) {
-            sg->context->error ("[RendererServices::texture3d] %s", err);
         }
     }
     return status;
@@ -310,14 +218,11 @@ RendererServices::environment (ustring filename, TextureHandle *texture_handle,
     ShadingContext *context = sg->context;
     if (! texture_thread_info)
         texture_thread_info = context->texture_thread_info();
-    bool status;
-    if (texture_handle)
-        status = texturesys()->environment (texture_handle, texture_thread_info,
-                                            options, R, dRdx, dRdy,
-                                            nchannels, result, dresultds, dresultdt);
-    else
-        status = texturesys()->environment (filename, options, R, dRdx, dRdy,
-                                            nchannels, result, dresultds, dresultdt);
+    if (! texture_handle)
+        texture_handle = texturesys()->get_texture_handle (filename, texture_thread_info);
+    bool status = texturesys()->environment (texture_handle, texture_thread_info,
+                                             options, R, dRdx, dRdy,
+                                             nchannels, result, dresultds, dresultdt);
     if (!status) {
         std::string err = texturesys()->geterror();
         if (err.size() && sg) {
@@ -335,56 +240,32 @@ RendererServices::environment (ustring filename, TextureHandle *texture_handle,
 
 
 
-// Deprecated version
 bool
-RendererServices::environment (ustring filename, TextureHandle *texture_handle,
-                               TexturePerthread *texture_thread_info,
-                               TextureOpt &options, ShaderGlobals *sg,
-                               const Vec3 &R, const Vec3 &dRdx, const Vec3 &dRdy,
-                               int nchannels, float *result,
-                               float *dresultds, float *dresultdt)
-{
-    ShadingContext *context = sg->context;
-    if (! texture_thread_info)
-        texture_thread_info = context->texture_thread_info();
-    bool status;
-    if (texture_handle)
-        status = texturesys()->environment (texture_handle, texture_thread_info,
-                                            options, R, dRdx, dRdy,
-                                            nchannels, result, dresultds, dresultdt);
-    else
-        status = texturesys()->environment (filename, options, R, dRdx, dRdy,
-                                            nchannels, result, dresultds, dresultdt);
-    if (!status) {
-        std::string err = texturesys()->geterror();
-        if (err.size() && sg) {
-            sg->context->error ("[RendererServices::environment] %s", err);
-        }
-    }
-    return status;
-}
-
-
-
-bool
-RendererServices::get_texture_info (ShaderGlobals *sg, ustring filename,
+RendererServices::get_texture_info (ustring filename,
                                     TextureHandle *texture_handle,
+                                    TexturePerthread *texture_thread_info,
+                                    ShadingContext *shading_context,
                                     int subimage, ustring dataname,
-                                    TypeDesc datatype, void *data)
+                                    TypeDesc datatype,
+                                    void *data, ustring *errormessage)
 {
-    bool status;
-#if OIIO_VERSION >= 10602
-    if (texture_handle)
-        status = texturesys()->get_texture_info (texture_handle, NULL, subimage,
-                                                 dataname, datatype, data);
-    else
-#endif
-        status = texturesys()->get_texture_info (filename, subimage,
-                                                 dataname, datatype, data);
+    if (! texture_thread_info)
+        texture_thread_info = shading_context->texture_thread_info();
+    if (! texture_handle)
+        texture_handle = texturesys()->get_texture_handle (filename, texture_thread_info);
+    bool status = texturesys()->get_texture_info (texture_handle, texture_thread_info, subimage,
+                                                  dataname, datatype, data);
     if (!status) {
         std::string err = texturesys()->geterror();
-        if (err.size() && sg) {
-            sg->context->error ("[RendererServices::get_texture_info] %s", err);
+        if (err.size()) {
+            if (errormessage) {
+                *errormessage = ustring(err);
+            } else {
+                shading_context->error ("[RendererServices::get_texture_info] %s", err);
+            }
+        } else if (errormessage) {
+            // gettextureinfo failed but did not provide an error, so none should be emitted
+            *errormessage = ustring();
         }
     }
     return status;

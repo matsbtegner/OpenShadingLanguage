@@ -22,12 +22,17 @@ brew list --versions
 brew install ccache
 brew install flex bison
 brew install ilmbase openexr
-brew install boost-python
+#brew install boost-python
 brew install opencolorio partio
-brew install freetype libraw libpng webp
-brew install llvm34
+brew install freetype libpng
+brew install llvm${LLVMBREWVER}
+brew install qt
 #brew install homebrew/science/hdf5 --with-threadsafe
 #brew install field3d webp ffmpeg openjpeg opencv
 echo ""
 echo "After brew installs:"
 brew list --versions
+
+# Set up paths. These will only affect the caller if this script is
+# run with 'source' rather than in a separate shell.
+export PATH=/usr/local/opt/qt5/bin:$PATH

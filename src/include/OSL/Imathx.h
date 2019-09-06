@@ -38,11 +38,24 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
+// Might be worth trying to use #pragma clang force_cuda_host_device_[begin/end]
+// and include the real _cuda.h.
+
+#ifndef __CUDACC__
 #include <OpenEXR/ImathVec.h>
 #include <OpenEXR/ImathMatrix.h>
 #include <OpenEXR/ImathColor.h>
+#else
+#define IMATH_HOSTDEVICE __host__ __device__
+#include <OSL/ImathLimits_cuda.h>
+#include <OSL/ImathVec_cuda.h>
+#include <OSL/ImathMatrix_cuda.h>
+#include <OSL/ImathColor_cuda.h>
+#endif
 
-#include "matrix22.h"
+
+// Extensions to Imath
+#include <OSL/matrix22.h>
 
 
 OSL_NAMESPACE_ENTER
@@ -51,7 +64,7 @@ OSL_NAMESPACE_ENTER
 /// 3x3 matrix transforming a 3-vector.  This is curiously not supplied
 /// by Imath, so we define it ourselves.
 template <class S, class T>
-inline void
+inline OSL_HOSTDEVICE void
 multMatrix (const Imath::Matrix33<T> &M, const Imath::Vec3<S> &src,
             Imath::Vec3<S> &dst)
 {
@@ -66,7 +79,7 @@ multMatrix (const Imath::Matrix33<T> &M, const Imath::Vec3<S> &src,
 
 /// Express dot product as a function rather than a method.
 template<class T>
-inline T
+inline OSL_HOSTDEVICE T
 dot (const Imath::Vec2<T> &a, const Imath::Vec2<T> &b)
 {
     return a.dot (b);
@@ -75,7 +88,7 @@ dot (const Imath::Vec2<T> &a, const Imath::Vec2<T> &b)
 
 /// Express dot product as a function rather than a method.
 template<class T>
-inline T
+inline OSL_HOSTDEVICE T
 dot (const Imath::Vec3<T> &a, const Imath::Vec3<T> &b)
 {
     return a.dot (b);
@@ -85,7 +98,7 @@ dot (const Imath::Vec3<T> &a, const Imath::Vec3<T> &b)
 
 /// Return the determinant of a 2x2 matrix.
 template <class T>
-inline
+inline OSL_HOSTDEVICE
 T determinant (const Imathx::Matrix22<T> &m)
 {
     return m[0][0]*m[1][1] - m[0][1]*m[1][0];

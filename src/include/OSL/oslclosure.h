@@ -29,8 +29,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include <cstring>
-#include <OpenImageIO/ustring.h>
-#include "oslconfig.h"
+#include <OSL/oslconfig.h>
 
 OSL_NAMESPACE_ENTER
 
@@ -94,17 +93,17 @@ struct OSLEXECPUBLIC ClosureColor {
 
     int id;
 
-    const ClosureComponent* as_comp() const {
+    OSL_HOSTDEVICE const ClosureComponent* as_comp() const {
         DASSERT(id >= COMPONENT_BASE_ID);
         return reinterpret_cast<const ClosureComponent*>(this);
     }
 
-    const ClosureMul* as_mul() const {
+    OSL_HOSTDEVICE const ClosureMul* as_mul() const {
         DASSERT(id == MUL);
         return reinterpret_cast<const ClosureMul*>(this);
     }
 
-    const ClosureAdd* as_add() const {
+    OSL_HOSTDEVICE const ClosureAdd* as_add() const {
         DASSERT(id == ADD);
         return reinterpret_cast<const ClosureAdd*>(this);
     }
@@ -114,29 +113,32 @@ struct OSLEXECPUBLIC ClosureColor {
 
 /// ClosureComponent is a subclass of ClosureColor that holds the ID and
 /// parameter data for a single primitive closure component (such as
-/// diffuse, translucent, etc.).  The declaration leaves 4 bytes for
-/// parameter data (mem), but it's expected that the structure be
-/// allocated with enough space to house all the parameter data for
-/// whatever type of custom primitive component it actually is.
-struct OSLEXECPUBLIC ClosureComponent : public ClosureColor
+/// diffuse, translucent, etc.).
+///
+/// ClosureComponent itself takes up 16 bytes, and its allocation will be
+/// scaled to add parameters after the end of the struct. Alignment is
+/// set to 16 bytes so that 64 bit pointers and 128 bit SSE types in user
+/// structs have the required alignment.
+#ifdef __CUDACC__
+/// Notice in the OptiX implementation we align this to 8 bytes
+/// so that it matches the alignment of the memory pools.
+struct OSLEXECPUBLIC OSL_ALIGNAS(8) ClosureComponent : public ClosureColor
+#else
+struct OSLEXECPUBLIC OSL_ALIGNAS(16) ClosureComponent : public ClosureColor
+#endif
 {
-    Vec3   w;        ///< Weight of this component
-    char   mem[4];   ///< Memory for the primitive
-                     ///  4 is the minimum, allocation
-                     ///  will be scaled to requirements
-                     ///  of the primitive
+    Vec3 w;                     ///< Weight of this component
 
     /// Handy method for getting the parameter memory as a void*.
-    ///
-    void *data () { return &mem; }
-    const void *data () const { return &mem; }
+    OSL_HOSTDEVICE void *data () { return (char*)(this + 1); }
+    OSL_HOSTDEVICE const void *data () const { return (const char*)(this + 1); }
 
     /// Handy methods for extracting the underlying parameters as a struct
     template <typename T>
-    const T* as() const { return reinterpret_cast<const T*>(mem); }
+    OSL_HOSTDEVICE const T* as() const { return reinterpret_cast<const T*>(data()); }
 
     template <typename T>
-    T* as() { return reinterpret_cast<const T*>(mem); }
+    OSL_HOSTDEVICE T* as() { return reinterpret_cast<const T*>(data()); }
 };
 
 

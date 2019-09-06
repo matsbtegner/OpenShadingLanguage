@@ -28,10 +28,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
-#include <boost/intrusive_ptr.hpp>
 #include <OpenImageIO/refcnt.h>
 
-#include "OSL/oslcomp.h"
+#include <OSL/oslcomp.h>
 #include "symtab.h"
 
 
@@ -55,7 +54,7 @@ class TypeSpec;
 ///
 class ASTNode : public OIIO::RefCnt {
 public:
-    typedef boost::intrusive_ptr<ASTNode> ref;  ///< Ref-counted pointer to an ASTNode
+    typedef OIIO::intrusive_ptr<ASTNode> ref;  ///< Ref-counted pointer to an ASTNode
 
     /// List of all the types of AST nodes.
     ///
@@ -93,7 +92,7 @@ public:
     ASTNode (NodeType nodetype, OSLCompilerImpl *compiler, int op,
              ASTNode *a, ASTNode *b, ASTNode *c, ASTNode *d);
 
-    virtual ~ASTNode () { }
+    virtual ~ASTNode ();
 
     /// Print a text description of this node (and its children) to the
     /// console, for debugging.
@@ -114,6 +113,10 @@ public:
     /// Name of the op, if any, or NULL.
     ///
     virtual const char *opname () const { return NULL; }
+
+    /// Return the number of child nodes.
+    ///
+    size_t nchildren () const { return m_children.size(); }
 
     /// Name of the child node
     ///
@@ -160,6 +163,9 @@ public:
     /// reference-counted pointer to *this.
     ref append (ref &x) { append (x.get()); return this; }
 
+    /// Detatch any 'next' nodes.
+    void detach_next () { m_next.reset(); }
+
     /// Concatenate ASTNode sequences A and B, returning a raw pointer to
     /// the concatenated sequence.  This is robust to either A or B or
     /// both being NULL.
@@ -169,6 +175,9 @@ public:
         else    // A not valid, so just go with B
             return B;
     }
+
+    /// Reverse the order of the list.
+    friend ASTNode::ref reverse (ASTNode::ref list);
 
     /// What source file was this parse node created from?
     ///
@@ -180,9 +189,36 @@ public:
 
     void sourceline (int line) { m_sourceline = line; }
 
-    // FIXME - some day, replace this with TinyFormat-based version.
-    void error (const char *format, ...);
-    void warning (const char *format, ...);
+    template<typename... Args>
+    void error (const char* format, const Args&... args) const
+    {
+        DASSERT (format && format[0]);
+        error_impl (OIIO::Strutil::sprintf (format, args...));
+    }
+
+    /// Warning reporting
+    template<typename... Args>
+    void warning (const char* format, const Args&... args) const
+    {
+        DASSERT (format && format[0]);
+        warning_impl (OIIO::Strutil::sprintf (format, args...));
+    }
+
+    /// info reporting
+    template<typename... Args>
+    void info (const char* format, const Args&... args) const
+    {
+        DASSERT (format && format[0]);
+        info_impl (OIIO::Strutil::sprintf (format, args...));
+    }
+
+    /// message reporting
+    template<typename... Args>
+    void message (const char* format, const Args&... args) const
+    {
+        DASSERT (format && format[0]);
+        message_impl (OIIO::Strutil::sprintf (format, args...));
+    }
 
     bool is_lvalue () const { return m_is_lvalue; }
 
@@ -227,42 +263,34 @@ protected:
 
     /// Flatten a list of nodes (headed by A) into a vector of node refs
     /// (vec).
-    static void list_to_vec (const ref &A, std::vector<ref> &vec) {
-        vec.clear ();
-        for (ref node = A; node; node = node->next())
-            vec.push_back (node);
-    }
+    static void list_to_vec (const ref &A, std::vector<ref> &vec);
 
     /// Turn a vector of node refs into a list of nodes, returning its
     /// head.
-    static ref vec_to_list (std::vector<ref> &vec) {
-        if (vec.size()) {
-            for (size_t i = 0;  i < vec.size()-1;  ++i)
-                vec[i]->m_next = vec[i+1];
-            vec[vec.size()-1]->m_next = NULL;
-            return vec[0];
-        } else {
-            return ref();
-        }
-    }
+    static ref vec_to_list (std::vector<ref> &vec);
 
-    /// Return the number of child nodes.
-    ///
-    size_t nchildren () const { return m_children.size(); }
+    /// Generate a comma-separated string of data types of the list headed
+    /// by node (for example, "float, int, string").
+    static std::string list_to_types_string (const ASTNode *node);
 
-    /// Return the i-th child node, or NULL if there is no such node
-    ///
+    /// Return a pointer for the i-th child node, or nullptr if there is no
+    /// such node.
     ASTNode *child (size_t i) const {
         return (i < m_children.size()) ? m_children[i].get() : NULL;
     }
 
     /// Add a new node to the list of children.
-    ///
-    void addchild (ASTNode *n) { m_children.push_back (n); }
+    void addchild (ASTNode *n) { m_children.emplace_back(n); }
+
+    /// Add a new node to the list of children.
+    void addchild (ref& n) { m_children.emplace_back(n); }
 
     /// Call the print() method of all the children of this node.
     ///
     void printchildren (std::ostream &out, int indentlevel = 0) const;
+
+    /// Clear the children. Use with caution!
+    void clearchildren () { m_children.clear(); }
 
     /// Follow a list of nodes, type checking each in turn, and return
     /// the type of the last one.
@@ -272,10 +300,16 @@ protected:
     ///
     void typecheck_children (TypeSpec expected = TypeSpec());
 
+    /// Helper for check_arglist: simple case of checking a single arg type
+    /// agaisnt the front of the formals list (which will be advanced).
+    bool check_simple_arg (const TypeSpec &argtype,
+                           const char * &formals, bool coerce);
+
     /// Type check a list (whose head is given by 'arg' against the list
     /// of expected types given in encoded form by 'formals'.
     bool check_arglist (const char *funcname, ref arg,
-                        const char *formals, bool coerce=false);
+                        const char *formals, bool coerce=false,
+                        bool bind = true);
 
     /// Follow a list of nodes, generating code for each in turn, and return
     /// the Symbol* for the last thing generated.
@@ -321,6 +355,41 @@ protected:
                                 bool copywholearrays, int intindex,
                                 bool paraminit);
 
+    // Helper: generate code for an initializer list -- either a single
+    // item to a scalar, or a list to an array.
+    void codegen_initlist (ref init, TypeSpec type, Symbol *sym);
+
+    // Special code generation for structure initializers.
+    // It's in the ASTNode base class because it's used from mutiple
+    // subclasses.
+    Symbol *codegen_struct_initializers (ref init, Symbol *sym,
+                                         bool is_constructor=false,
+                                         Symbol *arrayindex = nullptr);
+
+    // Codegen an array assignemnt: lval[index] = src
+    // If no index is provided the constant i is used.
+    // Will return either src or a temporary that was codegened.
+	Symbol*
+	codegen_aassign (TypeSpec elemtype, Symbol *src, Symbol *lval,
+                     Symbol* index, int i = 0);
+
+    // Check whether the node's symbol destination is ok to write. Return
+    // true if ok, return false and issue error or warning if not. (Used to
+    // check for writing to read-only variables like non-output parameters.)
+    bool check_symbol_writeability (ASTNode *var);
+
+    // Helper for param_default_literals: generate the string that gives
+    // the initialization of the literal value (and/or the default, if
+    // init==NULL) and append it to 'out'.  Return whether the full
+    // initialization is comprised only of literals (no init ops needed).
+    bool one_default_literal (const Symbol *sym, ASTNode *init,
+                      std::string &out, string_view separator=" ") const;
+
+    void error_impl (string_view msg) const;
+    void warning_impl (string_view msg) const;
+    void info_impl (string_view msg) const;
+    void message_impl (string_view msg) const;
+
 protected:
     NodeType m_nodetype;          ///< Type of node this is
     ref m_next;                   ///< Next node in the list
@@ -364,7 +433,8 @@ class ASTfunction_declaration : public ASTNode
 {
 public:
     ASTfunction_declaration (OSLCompilerImpl *comp, TypeSpec type, ustring name,
-                             ASTNode *form, ASTNode *stmts, ASTNode *meta=NULL);
+                             ASTNode *form, ASTNode *stmts, ASTNode *meta,
+                             int sourceline_start=-1);
     const char *nodetypename () const { return "function_declaration"; }
     const char *childname (size_t i) const;
     void print (std::ostream &out, int indentlevel=0) const;
@@ -379,7 +449,7 @@ public:
     FunctionSymbol *func () const { return (FunctionSymbol *)m_sym; }
 
     bool is_builtin () const { return m_is_builtin; }
-    void add_meta (ASTNode *meta);
+    void add_meta (ref meta);
 
 private:
     ustring m_name;
@@ -393,9 +463,9 @@ class ASTvariable_declaration : public ASTNode
 {
 public:
     ASTvariable_declaration (OSLCompilerImpl *comp, const TypeSpec &type,
-                             ustring name, ASTNode *init, bool isparam=false,
-                             bool ismeta=false, bool isoutput=false,
-                             bool initlist=false);
+                             ustring name, ASTNode *init, bool isparam,
+                             bool ismeta, bool isoutput,
+                             bool initlist, int sourceline_start=-1);
     const char *nodetypename () const;
     const char *childname (size_t i) const;
     void print (std::ostream &out, int indentlevel=0) const;
@@ -405,7 +475,7 @@ public:
     ref init () const { return child (0); }
     ref meta () const { return child (1); }
 
-    void add_meta (ASTNode *meta) {
+    void add_meta (ref meta) {
         while (nchildren() < 2)
             addchild (NULL);
         m_children[1] = meta;  // beware changing the order!
@@ -425,33 +495,11 @@ public:
 
     void codegen_initializer (ref init, Symbol *sym);
 
-    // Special code generation for structure initializers
-    Symbol *codegen_struct_initializers (ref init, Symbol *sym);
-
     void register_struct_init (ustring name, ASTNode *init) {
-        m_struct_field_inits.push_back (NamedInit (name, init));
+        m_struct_field_inits.emplace_back(name, init);
     }
 
 private:
-    // Helper: type check an initializer list -- either a single item to
-    // a scalar, or a list to an array.
-    void typecheck_initlist (ref init, TypeSpec type, const char *name);
-
-    // Special type checking for structure initializers
-    TypeSpec typecheck_struct_initializers (ref init, TypeSpec type,
-                                            const char *name);
-
-    // Helper: generate code for an initializer list -- either a single
-    // item to a scalar, or a list to an array.
-    void codegen_initlist (ref init, TypeSpec type, Symbol *sym);
-
-    // Helper for param_default_literals: generate the string that gives
-    // the initialization of the literal value (and/or the default, if
-    // init==NULL) and append it to 'out'.  Return whether the full
-    // initialization is comprised only of literals (no init ops needed).
-    bool param_one_default_literal (const Symbol *sym, ASTNode *init,
-                      std::string &out, const std::string &separator=" ") const;
-
     ustring m_name;     ///< Name of the symbol (unmangled)
     Symbol *m_sym;      ///< Ptr to the symbol this declares
     bool m_isparam;     ///< Is this a parameter?
@@ -488,9 +536,7 @@ private:
 class ASTpreincdec : public ASTNode
 {
 public:
-    ASTpreincdec (OSLCompilerImpl *comp, int op, ASTNode *expr)
-        : ASTNode (preincdec_node, comp, op, expr)
-    { }
+    ASTpreincdec (OSLCompilerImpl *comp, int op, ASTNode *expr);
     const char *nodetypename () const { return m_op==Incr ? "preincrement" : "predecrement"; }
     const char *childname (size_t i) const;
     TypeSpec typecheck (TypeSpec expected);
@@ -504,9 +550,7 @@ public:
 class ASTpostincdec : public ASTNode
 {
 public:
-    ASTpostincdec (OSLCompilerImpl *comp, int op, ASTNode *expr)
-        : ASTNode (postincdec_node, comp, op, expr)
-    { }
+    ASTpostincdec (OSLCompilerImpl *comp, int op, ASTNode *expr);
     const char *nodetypename () const { return m_op==Incr ? "postincrement" : "postdecrement"; }
     const char *childname (size_t i) const;
     TypeSpec typecheck (TypeSpec expected);
@@ -520,10 +564,10 @@ public:
 class ASTindex : public ASTNode
 {
 public:
-    ASTindex (OSLCompilerImpl *comp, ASTNode *expr, ASTNode *index);
-    ASTindex (OSLCompilerImpl *comp, ASTNode *expr, ASTNode *index, ASTNode *index2);
+    // ASTindex (OSLCompilerImpl *comp, ASTNode *expr, ASTNode *index);
+    // ASTindex (OSLCompilerImpl *comp, ASTNode *expr, ASTNode *index, ASTNode *index2);
     ASTindex (OSLCompilerImpl *comp, ASTNode *expr, ASTNode *index,
-              ASTNode *index2, ASTNode *index3);
+              ASTNode *index2 = nullptr, ASTNode *index3 = nullptr);
     const char *nodetypename () const { return "index"; }
     const char *childname (size_t i) const;
     TypeSpec typecheck (TypeSpec expected = TypeSpec());
@@ -534,8 +578,9 @@ public:
     Symbol *codegen (Symbol *dest, Symbol * &ind,
                      Symbol * &ind2, Symbol *&ind3);
 
-    /// Special code generation of assignment of src to this indexed location
-    ///
+    /// Special code generation of assignment of src to this indexed
+    /// location. The ind1, ind2, ind3 symbols are overrides; if not
+    /// provided, it will use index(), index2(), index3().
     void codegen_assign (Symbol *src, Symbol *ind = NULL,
                          Symbol *ind2 = NULL, Symbol *ind3 = NULL);
 
@@ -571,6 +616,8 @@ public:
     ustring field () const { return m_field; }
     ustring fieldname () const { return m_fieldname; }
     Symbol *fieldsym () const { return m_fieldsym; }
+    int fieldid () const { return m_fieldid; }
+    ASTindex* compindex() const { return (ASTindex*)m_compindex.get(); }
 
 private:
     Symbol *find_fieldsym (int &structid, int &fieldid);
@@ -583,6 +630,7 @@ private:
     int m_fieldid;           ///< index of the field within the structure
     ustring m_fieldname;     ///< Name of the field variable
     Symbol *m_fieldsym;      ///< Symbol of the field variable
+    ref m_compindex;         ///< Redirection of named component index
 };
 
 
@@ -616,9 +664,7 @@ public:
     };
 
     ASTloop_statement (OSLCompilerImpl *comp, LoopType looptype, ASTNode *init,
-                       ASTNode *cond, ASTNode *iter, ASTNode *stmt)
-        : ASTNode (loop_statement_node, comp, looptype, init, cond, iter, stmt)
-    { }
+                       ASTNode *cond, ASTNode *iter, ASTNode *stmt);
 
     const char *nodetypename () const { return "loop_statement"; }
     const char *childname (size_t i) const;
@@ -671,8 +717,41 @@ public:
 
 
 
-class ASTcompound_initializer : public ASTNode
+class ASTtype_constructor : public ASTNode
 {
+protected:
+    ASTtype_constructor (NodeType n, OSLCompilerImpl *c, TypeSpec t, ASTNode *a)
+        : ASTNode (n, c, Nothing, a) { m_typespec = t; }
+
+public:
+    ASTtype_constructor (OSLCompilerImpl *comp, TypeSpec typespec,
+                         ASTNode *args)
+        : ASTtype_constructor (type_constructor_node, comp, typespec, args) {}
+
+    const char *nodetypename () const { return "type_constructor"; }
+    const char *childname (size_t i) const;
+    Symbol *codegen (Symbol *dest = NULL);
+
+    ref args () const { return child (0); }
+
+    // Typecheck construction of expected against args()
+    // Optionally ignoring errors and binding any init-list arguments to the
+    // required type.
+    TypeSpec typecheck (TypeSpec expected, bool error, bool bind = true);
+
+    // Typecheck construction of m_typespec against args()
+    TypeSpec typecheck (TypeSpec expected) {
+        return typecheck (m_typespec, true, true);
+    }
+};
+
+
+class ASTcompound_initializer : public ASTtype_constructor
+{
+    bool m_ctor;
+
+    TypeSpec typecheck (TypeSpec expected, unsigned mode);
+
 public:
     ASTcompound_initializer (OSLCompilerImpl *comp, ASTNode *exprlist);
     const char *nodetypename () const { return "compound_initializer"; }
@@ -680,6 +759,16 @@ public:
     Symbol *codegen (Symbol *dest = NULL);
 
     ref initlist () const { return child (0); }
+
+    bool canconstruct() const { return m_ctor; }
+    void canconstruct(bool b) { m_ctor = b; }
+
+    TypeSpec typecheck (TypeSpec expected) {
+        return typecheck(expected, 0);
+    }
+
+    // Helper for typechecking an initlist or structure.
+    class TypeAdjuster;
 };
 
 
@@ -705,9 +794,7 @@ public:
 class ASTunary_expression : public ASTNode
 {
 public:
-    ASTunary_expression (OSLCompilerImpl *comp, int op, ASTNode *expr)
-        : ASTNode (unary_expression_node, comp, op, expr)
-    { }
+    ASTunary_expression (OSLCompilerImpl *comp, int op, ASTNode *expr);
 
     const char *nodetypename () const { return "unary_expression"; }
     const char *childname (size_t i) const;
@@ -717,6 +804,8 @@ public:
     Symbol *codegen (Symbol *dest = NULL);
 
     ref expr () const { return child (0); }
+private:
+    FunctionSymbol *m_function_overload = nullptr;
 };
 
 
@@ -725,9 +814,7 @@ class ASTbinary_expression : public ASTNode
 {
 public:
     ASTbinary_expression (OSLCompilerImpl *comp, Operator op,
-                          ASTNode *left, ASTNode *right)
-        : ASTNode (binary_expression_node, comp, op, left, right)
-    { }
+                          ASTNode *left, ASTNode *right);
 
     const char *nodetypename () const { return "binary_expression"; }
     const char *childname (size_t i) const;
@@ -739,6 +826,8 @@ public:
     ref left () const { return child (0); }
     ref right () const { return child (1); }
 private:
+    FunctionSymbol *m_function_overload = nullptr;
+
     // Special code generation for short-circuiting logical ops
     Symbol *codegen_logic (Symbol *dest);
 };
@@ -804,30 +893,11 @@ public:
 
 
 
-class ASTtype_constructor : public ASTNode
-{
-public:
-    ASTtype_constructor (OSLCompilerImpl *comp, TypeSpec typespec,
-                         ASTNode *args)
-        : ASTNode (type_constructor_node, comp, 0, args)
-    {
-        m_typespec = typespec;
-    }
-
-    const char *nodetypename () const { return "type_constructor"; }
-    const char *childname (size_t i) const;
-    TypeSpec typecheck (TypeSpec expected);
-    Symbol *codegen (Symbol *dest = NULL);
-
-    ref args () const { return child (0); }
-};
-
-
-
 class ASTfunction_call : public ASTNode
 {
 public:
-    ASTfunction_call (OSLCompilerImpl *comp, ustring name, ASTNode *args);
+    ASTfunction_call (OSLCompilerImpl *comp, ustring name, ASTNode *args,
+                      FunctionSymbol *funcsym = nullptr);
     const char *nodetypename () const { return "function_call"; }
     const char *childname (size_t i) const;
     const char *opname () const;
@@ -838,30 +908,22 @@ public:
     FunctionSymbol *func () const { return (FunctionSymbol *)m_sym; }
     ref args () const { return child (0); }
 
+    /// Is it a struct constructor?
+    bool is_struct_ctr () const { return m_sym && m_sym->is_structure(); }
+
     /// Is it a user-defined function (as opposed to an OSL built-in)?
     ///
     bool is_user_function () const {
-        return user_function() && !user_function()->is_builtin();
+        return !is_struct_ctr() && user_function() && !user_function()->is_builtin();
     }
 
     /// Pointer to the ASTfunction_declaration node that defines the user
     /// function, or NULL if it's not a user-defined function.
     ASTfunction_declaration * user_function () const {
-        return (ASTfunction_declaration *) func()->node();
+        return func() ? (ASTfunction_declaration *) func()->node() : nullptr;
     }
 
 private:
-    /// Typecheck all polymorphic versions, return UNKNOWN if no match was
-    /// found, or a real type if there was a match.  Also, upon matching,
-    /// re-jigger m_sym to point to the specific polymorphic match.
-    /// Allow arguments to be coerced (e.g., substituting a vector where
-    /// a point was expected, or a float where a color was expected) only
-    /// if coerceargs is true.  For return values, allow spatial triples to
-    /// mutually match if 'equivreturn' is true, and allow any coercive
-    /// return type if 'expected' is TypeSpec() (i.e., unknown).
-    TypeSpec typecheck_all_poly (TypeSpec expected, bool coerceargs,
-                                 bool equivreturn);
-
     /// Handle all the special cases for built-ins.  This includes
     /// irregular patterns of which args are read vs written, special
     /// checks for printf- and texture-like, etc.
@@ -871,6 +933,9 @@ private:
     /// arguments poitned to by arg.  If ok, return true, otherwise
     /// return false and call an appropriate error().
     bool typecheck_printf_args (const char *format, ASTNode *arg);
+
+    /// Handle "funcion calls" that are really struct ctrs.
+    TypeSpec typecheck_struct_constructor ();
 
     /// Is the argument number 'arg' read by the op?
     ///

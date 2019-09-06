@@ -32,12 +32,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <map>
 #include <set>
 
-#include <boost/version.hpp>
-#if BOOST_VERSION >= 104900
-# include <boost/container/flat_map.hpp>
-# include <boost/container/flat_set.hpp>
-# define USE_FLAT_MAP 1
-#endif
+#include <boost/container/flat_map.hpp>
+#include <boost/container/flat_set.hpp>
+#define USE_FLAT_MAP 1
 
 #include "oslexec_pvt.h"
 using namespace OSL;
@@ -111,6 +108,7 @@ public:
     int add_constant (int c) { return add_constant(TypeDesc::TypeInt, &c); }
     int add_constant (ustring s) { return add_constant(TypeDesc::TypeString, &s); }
     int add_constant (const Matrix44 &c) { return add_constant(TypeDesc::TypeMatrix, &c); }
+    int add_constant (const Color3 &c) { return add_constant(TypeDesc::TypeColor, &c); }
 
     /// Create a new temporary variable of the given type, return its index.
     int add_temp (const TypeSpec &type);
@@ -156,9 +154,12 @@ public:
     int turn_into_nop (int begin, int end, string_view why=NULL);
 
     void debug_opt_impl (string_view message) const;
-    TINYFORMAT_WRAP_FORMAT (void, debug_opt, const,
-                            std::ostringstream msg;, msg,
-                            debug_opt_impl(msg.str());)
+
+    template<typename... Args>
+    inline void debug_opt (const char* fmt, const Args&... args) const {
+        debug_opt_impl (OIIO::Strutil::sprintf (fmt, args...));
+    }
+
     void debug_opt_ops (int opbegin, int opend, string_view message) const;
     void debug_turn_into (const Opcode &op, int numops,
                           string_view newop, int newarg0,
@@ -239,7 +240,8 @@ public:
 
     /// Is the op a "simple" assignment (arg 0 completely overwritten,
     /// no side effects or funny business)?
-    bool is_simple_assign (Opcode &op);
+    /// Optional OpDescriptor is passed to save an extra lookup.
+    bool is_simple_assign (Opcode &op, const OpDescriptor *opd=NULL);
 
     /// Called when symbol sym is "simply" assigned at the given op.  An
     /// assignment is considered simple if it completely overwrites the
@@ -282,12 +284,7 @@ public:
     /// subsequent instruction; NoRelation means we have no information,
     /// so don't copy that info from anywhere.
     void insert_code (int opnum, ustring opname,
-                      const std::vector<int> &args_to_add,
-                      RecomputeRWRangesOption recompute_rw_ranges,
-                      InsertRelation relation=GroupWithNext);
-    /// insert_code with begin/end arg array pointers.
-    void insert_code (int opnum, ustring opname,
-                      const int *argsbegin, const int *argsend,
+                      const cspan<int> args_to_add,
                       RecomputeRWRangesOption recompute_rw_ranges,
                       InsertRelation relation=GroupWithNext);
     /// insert_code with explicit arguments (up to 4, a value of -1 means
@@ -406,6 +403,12 @@ public:
                              const FastIntSet *excluded=NULL,
                              bool copy_temps=false);
 
+    /// After optimization, check for things that should not be left
+    /// unoptimized.
+    bool police_failed_optimizations ();
+    enum { police_opt_warn = 1, police_gpu_err = 3, police_gpu_err_only = 2 };  // bit field
+    bool police(const Opcode& op, string_view msg, int type = police_opt_warn);
+
 private:
     int m_optimize;                   ///< Current optimization level
     bool m_opt_simplify_param;            ///< Turn instance params into const?
@@ -421,7 +424,7 @@ private:
     ShaderGlobals m_shaderglobals;        ///< Dummy ShaderGlobals
 
     // Keep track of some things for the whole shader group:
-    typedef boost::unordered_map<ustring,ustring,ustringHash> ustringmap_t;
+    typedef std::unordered_map<ustring,ustring,ustringHash> ustringmap_t;
     std::vector<ustringmap_t> m_params_holding_globals;
                    ///< Which params of each layer really just hold globals
 
@@ -440,6 +443,8 @@ private:
     std::set<ustring> m_textures_needed;
     std::set<ustring> m_closures_needed;
     std::set<ustring> m_globals_needed;
+    int m_globals_read = 0;
+    int m_globals_write = 0;
     std::set<AttributeNeeded> m_attributes_needed;
     bool m_unknown_textures_needed;
     bool m_unknown_closures_needed;

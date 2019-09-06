@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from __future__ import print_function
 import os
 import glob
 import sys
@@ -18,7 +19,13 @@ from optparse import OptionParser
 
 srcdir = "."
 tmpdir = "."
-path = "../.."
+
+OSL_BUILD_DIR = os.environ.get("OSL_BUILD_DIR", "../..")
+OSL_SOURCE_DIR = os.environ.get("OSL_SOURCE_DIR", "../../../..")
+OSL_TESTSUITE_DIR = os.path.join(OSL_SOURCE_DIR, "testsuite")
+OPENIMAGEIO_ROOT_DIR = os.environ.get("OPENIMAGEIO_ROOT_DIR", None)
+
+os.environ['OSLHOME'] = os.path.join(OSL_SOURCE_DIR, "src")
 
 # Options for the command line
 parser = OptionParser()
@@ -35,15 +42,19 @@ if args and len(args) > 0 :
     srcdir = os.path.abspath (srcdir) + "/"
     os.chdir (srcdir)
 if args and len(args) > 1 :
-    path = args[1]
-path = os.path.normpath (path)
+    OSL_BUILD_DIR = args[1]
+OSL_BUILD_DIR = os.path.normpath (OSL_BUILD_DIR)
 
 tmpdir = "."
 tmpdir = os.path.abspath (tmpdir)
+if platform.system() == 'Windows' :
+    redirect = " >> out.txt 2>&1 "
+else :
+    redirect = " >> out.txt 2>>out.txt "
 
 refdir = "ref/"
-parent = "../../../../../"
-test_source_dir = "../../../../testsuite/" + os.path.basename(os.path.abspath(srcdir))
+test_source_dir = os.path.join(OSL_TESTSUITE_DIR,
+                               os.path.basename(os.path.abspath(srcdir)))
 
 command = ""
 outputs = [ "out.txt" ]    # default
@@ -51,6 +62,10 @@ failureok = 0
 failthresh = 0.004
 hardfail = 0.01
 failpercent = 0.02
+oslcargs = "-Wall"
+
+image_extensions = [ ".tif", ".tx", ".exr", ".jpg", ".png", ".rla",
+                     ".dpx", ".iff", ".psd" ]
 
 compile_osl_files = True
 splitsymbol = ';'
@@ -59,16 +74,27 @@ splitsymbol = ';'
 #print ("tmpdir = " + tmpdir)
 #print ("path = " + path)
 #print ("refdir = " + refdir)
-print ("test source dir = " + test_source_dir)
+print ("test source dir = ", test_source_dir)
 
-if not os.path.exists("./ref") :
-    os.symlink (os.path.join (test_source_dir, "ref"), "./ref")
-if os.path.exists (os.path.join (test_source_dir, "src")) and not os.path.exists("./src") :
-    os.symlink (os.path.join (test_source_dir, "src"), "./src")
-if not os.path.exists("./data") :
-    os.symlink (test_source_dir, "./data")
-if not os.path.exists("../common") :
-    os.symlink ("../../../testsuite/common", "../common")
+if platform.system() == 'Windows' :
+    if not os.path.exists("./ref") :
+        shutil.copytree (os.path.join (test_source_dir, "ref"), "./ref")
+    if os.path.exists (os.path.join (test_source_dir, "src")) and not os.path.exists("./src") :
+        shutil.copytree (os.path.join (test_source_dir, "src"), "./src")
+    if not os.path.exists(os.path.abspath("data")) :
+        shutil.copytree (test_source_dir, os.path.abspath("data"))
+    if not os.path.exists(os.path.abspath("../common")) :
+        shutil.copytree (os.path.abspath(os.path.join(OSL_TESTSUITE_DIR, "common")),
+                         os.path.abspath("../common"))
+else :
+    if not os.path.exists("./ref") :
+        os.symlink (os.path.join (test_source_dir, "ref"), "./ref")
+    if os.path.exists (os.path.join (test_source_dir, "src")) and not os.path.exists("./src") :
+        os.symlink (os.path.join (test_source_dir, "src"), "./src")
+    if not os.path.exists("./data") :
+        os.symlink (test_source_dir, "./data")
+    if not os.path.exists("../common") :
+        os.symlink (os.path.join(OSL_TESTSUITE_DIR, "common"), "../common")
 
 ###########################################################################
 
@@ -99,6 +125,9 @@ def text_diff (fromfile, tofile, diff_file=None):
     if diff_file:
         try:
             open (diff_file, 'w').writelines (diff_lines)
+            print ("Diff " + fromfile + " vs " + tofile + " was:\n-------")
+#            print (diff)
+            print ("".join(diff_lines))
         except:
             print ("Unexpected error:", sys.exc_info()[0])
     return 1
@@ -106,14 +135,12 @@ def text_diff (fromfile, tofile, diff_file=None):
 
 
 def osl_app (app):
-    # when we use Visual Studio, built applications are stored
-    # in the app/$(OutDir)/ directory, e.g., Release or Debug.
-    # In that case the special token "$<CONFIGURATION>" which is replaced by
-    # the actual configuration if one is specified. "$<CONFIGURATION>" works
-    # because on Windows it is a forbidden filename due to the "<>" chars.
+    apath = os.path.join(OSL_BUILD_DIR, "src", app)
     if (platform.system () == 'Windows'):
-        return app + "/$<CONFIGURATION>/" + app + " "
-    return path + "/src/" + app + "/" + app + " "
+        # when we use Visual Studio, built applications are stored
+        # in the app/$(OutDir)/ directory, e.g., Release or Debug.
+        apath = os.path.join(apath, options.devenv_config)
+    return os.path.join(apath, app) + " "
 
 
 def oiio_relpath (path, start=os.curdir):
@@ -123,8 +150,8 @@ def oiio_relpath (path, start=os.curdir):
 
 
 def oiio_app (app):
-    if os.environ.__contains__('OPENIMAGEIOHOME') :
-        return os.path.join (os.environ['OPENIMAGEIOHOME'], "bin", app) + " "
+    if OPENIMAGEIO_ROOT_DIR :
+        return os.path.join (OPENIMAGEIO_ROOT_DIR, "bin", app) + " "
     else :
         return app + " "
 
@@ -132,25 +159,25 @@ def oiio_app (app):
 # Construct a command that will compile the shader file, appending output to
 # the file "out.txt".
 def oslc (args) :
-    return (osl_app("oslc") + args + " >> out.txt 2>&1 ;\n")
+    return (osl_app("oslc") + oslcargs + " " + args + redirect + " ;\n")
 
 
 # Construct a command that will run oslinfo, appending output to
 # the file "out.txt".
 def oslinfo (args) :
-    return (osl_app("oslinfo") + args + " >> out.txt 2>&1 ;\n")
+    return (osl_app("oslinfo") + args + redirect + " ;\n")
 
 
 # Construct a command that runs oiiotool, appending console output
 # to the file "out.txt".
 def oiiotool (args) :
-    return (oiio_app("oiiotool") + args + " >> out.txt 2>&1 ;\n")
+    return (oiio_app("oiiotool") + args + redirect + " ;\n")
 
 
 # Construct a command that runs maketx, appending console output
 # to the file "out.txt".
 def maketx (args) :
-    return (oiio_app("maketx") + args + " >> out.txt 2>&1 ;\n")
+    return (oiio_app("maketx") + args + redirect + " ;\n")
 
 # Construct a command that will compare two images, appending output to
 # the file "out.txt".  We allow a small number of pixels to have up to
@@ -166,7 +193,7 @@ def oiiodiff (fileA, fileB, extraargs="", silent=True, concat=True) :
                + " " + extraargs + " " + oiio_relpath(fileA,tmpdir)
                + " " + oiio_relpath(fileB,tmpdir))
     if not silent :
-        command += " >> out.txt 2>&1 "
+        command += redirect
     if concat:
         command += " ;\n"
     return command
@@ -179,13 +206,23 @@ def testshade (args) :
         testshadename = os.environ['OSL_TESTSHADE_NAME'] + " "
     else :
         testshadename = osl_app("testshade")
-    return (testshadename + args + " >> out.txt 2>&1 ;\n")
+    return (testshadename + args + redirect + " ;\n")
 
 
 # Construct a command that run testrender with the specified arguments,
 # appending output to the file "out.txt".
 def testrender (args) :
-    return (osl_app("testrender") + " -v --stats " + args + " >> out.txt 2>&1 ;\n")
+    os.environ["optix_log_level"] = "0"
+    return (osl_app("testrender") + " " + args + redirect + " ;\n")
+
+
+# Construct a command that run testoptix with the specified arguments,
+# appending output to the file "out.txt".
+def testoptix (args) :
+    # Disable OptiX logging to prevent messages from the library from
+    # appearing in the program output.
+    os.environ["optix_log_level"] = "0"
+    return (osl_app("testoptix") + " " + args + redirect + " ;\n")
 
 
 # Run 'command'.  For each file in 'outputs', compare it to the copy
@@ -199,14 +236,6 @@ def runtest (command, outputs, failureok=0, failthresh=0, failpercent=0) :
 
     if options.path != "" :
         sys.path = [options.path] + sys.path
-    print "command = " + command
-
-    if (platform.system () == 'Windows'):
-        # Replace the /$<CONFIGURATION>/ component added in oiio_app
-        oiio_app_replace_str = "/"
-        if options.devenv_config != "":
-            oiio_app_replace_str = '/' + options.devenv_config + '/'
-        command = command.replace ("/$<CONFIGURATION>/", oiio_app_replace_str)
 
     test_environ = None
     if (platform.system () == 'Windows') and (options.solution_path != "") and \
@@ -217,11 +246,17 @@ def runtest (command, outputs, failureok=0, failthresh=0, failpercent=0) :
             libOIIO_path = libOIIO_path + '\\' + options.devenv_config
         test_environ["PATH"] = libOIIO_path + ';' + test_environ["PATH"]
 
+    print ("command = ", command)
     for sub_command in command.split(splitsymbol):
+        sub_command = sub_command.lstrip().rstrip()
+        #print ("running = ", sub_command)
         cmdret = subprocess.call (sub_command, shell=True, env=test_environ)
         if cmdret != 0 and failureok == 0 :
-            print "#### Error: this command failed: ", sub_command
-            print "FAIL"
+            print ("#### Error: this command failed: ", sub_command)
+            print ("FAIL")
+            print ("Output was:\n--------")
+            print (open ("out.txt", 'rU').read())
+            print ("--------")
             return (1)
 
     err = 0
@@ -237,7 +272,7 @@ def runtest (command, outputs, failureok=0, failthresh=0, failpercent=0) :
             if extension == ".tif" or extension == ".exr" :
                 # images -- use idiff
                 cmpcommand = oiiodiff (out, testfile, concat=False, silent=True)
-                # print "cmpcommand = " + cmpcommand
+                # print ("cmpcommand = ", cmpcommand)
                 cmpresult = os.system (cmpcommand)
             elif extension == ".txt" :
                 cmpresult = text_diff (out, testfile, out + ".diff")
@@ -252,11 +287,11 @@ def runtest (command, outputs, failureok=0, failthresh=0, failpercent=0) :
             # if extension == ".tif" or extension == ".exr" or extension == ".jpg" or extension == ".png":
             #     # If we got a match for an image, save the idiff results
             #     os.system (oiiodiff (out, testfile, silent=False))
-            print ("PASS: " + out + " matches " + testfile)
+            print ("PASS: ", out, " matches ", testfile)
         else :
             err = 1
-            print "NO MATCH for " + out
-            print "FAIL " + out
+            print ("NO MATCH for ", out)
+            print ("FAIL ", out)
             if extension == ".txt" :
                 # If we failed to get a match for a text file, print the
                 # file and the diff, for easy debugging.
@@ -300,12 +335,9 @@ if (("TRAVIS" in os.environ and os.environ["TRAVIS"]) or
 
 # Force any local shaders to compile automatically, prepending the
 # compilation onto whatever else the individual run.py file requested.
-for testfile in glob.glob (os.path.join (test_source_dir, "*.osl")) :
-    shutil.copyfile (testfile, os.path.basename(testfile))
-for testfile in glob.glob (os.path.join (test_source_dir, "*.h")) :
-    shutil.copyfile (testfile, os.path.basename(testfile))
-for testfile in glob.glob (os.path.join (test_source_dir, "*.xml")) :
-    shutil.copyfile (testfile, os.path.basename(testfile))
+for filetype in [ "*.osl", "*.h", "*.oslgroup", "*.xml" ] :
+    for testfile in glob.glob (os.path.join (test_source_dir, filetype)) :
+        shutil.copyfile (testfile, os.path.basename(testfile))
 if compile_osl_files :
     compiles = ""
     oslfiles = glob.glob ("*.osl")

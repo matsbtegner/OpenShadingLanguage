@@ -30,9 +30,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <string>
 #include <cstdio>
 
-#include <boost/foreach.hpp>
-#include <boost/regex.hpp>
-
 #include <OpenImageIO/dassert.h>
 #include <OpenImageIO/sysutil.h>
 #include <OpenImageIO/timer.h>
@@ -62,9 +59,6 @@ ShadingContext::~ShadingContext ()
 {
     process_errors ();
     m_shadingsys.m_stat_contexts -= 1;
-    for (RegexMap::iterator it = m_regex_map.begin(); it != m_regex_map.end(); ++it) {
-      delete it->second;
-    }
     free_dict_resources ();
 }
 
@@ -82,11 +76,13 @@ ShadingContext::execute_init (ShaderGroup &sgroup, ShaderGlobals &ssg, bool run)
     if (sgroup.nlayers()) {
         sgroup.start_running ();
         if (! sgroup.optimized()) {
-            shadingsys().optimize_group (sgroup);
+            auto ctx = shadingsys().get_context(thread_info());
+            shadingsys().optimize_group (sgroup, ctx);
             if (shadingsys().m_greedyjit && shadingsys().m_groups_to_compile_count) {
                 // If we are greedily JITing, optimize/JIT everything now
                 shadingsys().optimize_all_groups ();
             }
+            shadingsys().release_context(ctx);
         }
         if (sgroup.does_nothing())
             return false;
@@ -96,11 +92,7 @@ ShadingContext::execute_init (ShaderGroup &sgroup, ShaderGlobals &ssg, bool run)
     }
 
     int profile = shadingsys().m_profile;
-#if OIIO_VERSION >= 10608
     OIIO::Timer timer (profile ? OIIO::Timer::StartNow : OIIO::Timer::DontStartNow);
-#else
-    OIIO::Timer timer (profile);
-#endif
 
     // Allocate enough space on the heap
     size_t heap_size_needed = sgroup.llvm_groupdata_size();
@@ -150,11 +142,7 @@ ShadingContext::execute_layer (ShaderGlobals &ssg, int layernumber)
     DASSERT (ssg.context == this && ssg.renderer == renderer());
 
     int profile = shadingsys().m_profile;
-#if OIIO_VERSION >= 10608
     OIIO::Timer timer (profile ? OIIO::Timer::StartNow : OIIO::Timer::DontStartNow);
-#else
-    OIIO::Timer timer (profile);
-#endif
 
     RunLLVMGroupFunc run_func = group()->llvm_compiled_layer (layernumber);
     if (! run_func)
@@ -233,7 +221,7 @@ void
 ShadingContext::record_error (ErrorHandler::ErrCode code,
                               const std::string &text) const
 {
-    m_buffered_errors.push_back (ErrorItem(code,text));
+    m_buffered_errors.emplace_back(code,text);
     // If we aren't buffering, just process immediately
     if (! shadingsys().m_buffer_printf)
         process_errors ();
@@ -310,14 +298,14 @@ ShadingContext::symbol_data (const Symbol &sym) const
 
 
 
-const boost::regex &
+const regex &
 ShadingContext::find_regex (ustring r)
 {
     RegexMap::const_iterator found = m_regex_map.find (r);
     if (found != m_regex_map.end())
         return *found->second;
     // otherwise, it wasn't found, add it
-    m_regex_map[r] = new boost::regex(r.c_str());
+    m_regex_map[r].reset (new regex(r.c_str()));
     m_shadingsys.m_stat_regexes += 1;
     // std::cerr << "Made new regex for " << r << "\n";
     return *m_regex_map[r];
@@ -338,14 +326,11 @@ ShadingContext::osl_get_attribute (ShaderGlobals *sg, void *objdata,
 #endif
     bool ok;
 
-    for (int i = 0;  i < FAILED_ATTRIBS;  ++i) {
-        if ((obj_name || m_failed_attribs[i].objdata == objdata) &&
-            m_failed_attribs[i].attr_name == attr_name &&
-            m_failed_attribs[i].obj_name == obj_name &&
-            m_failed_attribs[i].attr_type == attr_type &&
-            m_failed_attribs[i].array_lookup == array_lookup &&
-            m_failed_attribs[i].index == index &&
-            m_failed_attribs[i].objdata) {
+    for (auto& f : m_failed_attribs) {
+        if ((!obj_name.empty() || f.objdata == objdata) &&
+            f.attr_name == attr_name && f.obj_name == obj_name &&
+            f.attr_type == attr_type && f.array_lookup == array_lookup &&
+            f.index == index && f.objdata) {
 #if 0
             double time = timer();
             shadingsys().m_stat_getattribute_time += time;

@@ -37,20 +37,33 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "oslcomp_pvt.h"
 
-#include <OpenImageIO/strutil.h>
+#include <OpenImageIO/platform.h>
 #include <OpenImageIO/sysutil.h>
 #include <OpenImageIO/strutil.h>
 #include <OpenImageIO/dassert.h>
 #include <OpenImageIO/filesystem.h>
 #include <OpenImageIO/thread.h>
 
-#include <boost/foreach.hpp>
-
-#include <boost/wave.hpp>
-#include <boost/wave/cpplexer/cpp_lex_token.hpp>
-#include <boost/wave/cpplexer/cpp_lex_iterator.hpp>
-#if OIIO_VERSION < 10604
-#include <boost/filesystem.hpp>
+#ifndef USE_BOOST_WAVE
+# define USE_BOOST_WAVE 0
+#endif
+#if USE_BOOST_WAVE
+# include <boost/wave.hpp>
+# include <boost/wave/cpplexer/cpp_lex_token.hpp>
+# include <boost/wave/cpplexer/cpp_lex_iterator.hpp>
+#else
+# if !defined(__STDC_CONSTANT_MACROS)
+#   define __STDC_CONSTANT_MACROS 1
+# endif
+# include <clang/Frontend/CompilerInstance.h>
+# include <clang/Frontend/TextDiagnosticPrinter.h>
+# include <clang/Frontend/Utils.h>
+# include <clang/Basic/TargetInfo.h>
+# include <clang/Lex/PreprocessorOptions.h>
+# include <llvm/Support/ToolOutputFile.h>
+# include <llvm/Support/Host.h>
+# include <llvm/Support/MemoryBuffer.h>
+# include <llvm/Support/raw_ostream.h>
 #endif
 
 
@@ -82,12 +95,12 @@ OSLCompiler::compile (string_view filename,
 
 
 bool
-OSLCompiler::compile_buffer (string_view sourcecode,
-                             std::string &osobuffer,
+OSLCompiler::compile_buffer (string_view sourcecode, std::string &osobuffer,
                              const std::vector<std::string> &options,
-                             string_view stdoslpath)
+                             string_view stdoslpath, string_view filename)
 {
-    return m_impl->compile_buffer (sourcecode, osobuffer, options, stdoslpath);
+    return m_impl->compile_buffer (sourcecode, osobuffer, options,
+                                   stdoslpath, filename);
 }
 
 
@@ -103,7 +116,8 @@ OSLCompiler::output_filename () const
 namespace pvt {   // OSL::pvt
 
 
-OSLCompilerImpl *oslcompiler = NULL;
+OSLCompilerImpl *oslcompiler = nullptr;
+static std::mutex oslcompiler_mutex;
 
 static ustring op_for("for");
 static ustring op_while("while");
@@ -116,9 +130,10 @@ OSLCompilerImpl::OSLCompilerImpl (ErrorHandler *errhandler)
       m_err(false), m_symtab(*this),
       m_current_typespec(TypeDesc::UNKNOWN), m_current_output(false),
       m_verbose(false), m_quiet(false), m_debug(false),
-      m_preprocess_only(false), m_optimizelevel(1),
+      m_preprocess_only(false), m_err_on_warning(false),
+      m_optimizelevel(1),
       m_next_temp(0), m_next_const(0),
-      m_osofile(NULL), m_sourcefile(NULL), m_last_sourceline(0),
+      m_osofile(NULL),
       m_total_nesting(0), m_loop_nesting(0), m_derivsym(NULL),
       m_main_method_start(-1),
       m_declaring_shader_formals(false)
@@ -131,45 +146,7 @@ OSLCompilerImpl::OSLCompilerImpl (ErrorHandler *errhandler)
 
 OSLCompilerImpl::~OSLCompilerImpl ()
 {
-    if (m_sourcefile) {
-        fclose (m_sourcefile);
-        m_sourcefile = NULL;
-    }
     delete m_derivsym;
-}
-
-
-
-void
-OSLCompilerImpl::error (ustring filename, int line, const char *format, ...) const
-{
-    va_list ap;
-    va_start (ap, format);
-    std::string errmsg = format ? OIIO::Strutil::vformat (format, ap) : "syntax error";
-    if (filename.c_str())
-        m_errhandler->error ("%s:%d: error: %s",
-                             filename.c_str(), line, errmsg.c_str());
-    else
-        m_errhandler->error ("error: %s", errmsg.c_str());
-
-    va_end (ap);
-    m_err = true;
-}
-
-
-
-void
-OSLCompilerImpl::warning (ustring filename, int line, const char *format, ...) const
-{
-    va_list ap;
-    va_start (ap, format);
-    std::string errmsg = format ? OIIO::Strutil::vformat (format, ap) : "";
-    if (filename.c_str())
-        m_errhandler->error ("%s:%d: warning: %s",
-                             filename.c_str(), line, errmsg.c_str());
-    else
-        m_errhandler->error ("warning: %s", errmsg.c_str());
-    va_end (ap);
 }
 
 
@@ -200,6 +177,8 @@ OSLCompilerImpl::preprocess_file (const std::string &filename,
 
 
 
+#if USE_BOOST_WAVE
+
 bool
 OSLCompilerImpl::preprocess_buffer (const std::string &buffer,
                                     const std::string &filename,
@@ -213,7 +192,7 @@ OSLCompilerImpl::preprocess_buffer (const std::string &buffer,
 
     std::string instring;
     if (!stdoslpath.empty())
-        instring = OIIO::Strutil::format("#include \"%s\"\n", stdoslpath.c_str());
+        instring = OIIO::Strutil::sprintf("#include \"%s\"\n", stdoslpath);
     else
         instring = "\n";
     instring += buffer;
@@ -227,10 +206,20 @@ OSLCompilerImpl::preprocess_buffer (const std::string &buffer,
         context_type ctx (instring.begin(), instring.end(), filename.c_str());
 
         // Turn on support of variadic macros, e.g. #define FOO(...) __VA_ARGS__
+        // Turn off whitespace insertion.
         boost::wave::language_support lang = boost::wave::language_support (
-                ctx.get_language() | boost::wave::support_option_variadics);
+                (ctx.get_language() | boost::wave::support_option_variadics)
+                & ~boost::wave::language_support::support_option_insert_whitespace);
         ctx.set_language (lang);
 
+        ctx.add_macro_definition (OIIO::Strutil::sprintf("OSL_VERSION_MAJOR=%d",
+                                                  OSL_LIBRARY_VERSION_MAJOR).c_str());
+        ctx.add_macro_definition (OIIO::Strutil::sprintf("OSL_VERSION_MINOR=%d",
+                                                  OSL_LIBRARY_VERSION_MINOR).c_str());
+        ctx.add_macro_definition (OIIO::Strutil::sprintf("OSL_VERSION_PATCH=%d",
+                                                  OSL_LIBRARY_VERSION_PATCH).c_str());
+        ctx.add_macro_definition (OIIO::Strutil::sprintf("OSL_VERSION=%d",
+                                                  OSL_LIBRARY_VERSION_CODE).c_str());
         for (size_t i = 0; i < defines.size(); ++i) {
             if (defines[i][1] == 'D')
                 ctx.add_macro_definition (defines[i].c_str()+2);
@@ -293,6 +282,110 @@ OSLCompilerImpl::preprocess_buffer (const std::string &buffer,
 }
 
 
+#else /* LLVM: vvvvvvvvvv */
+
+bool
+OSLCompilerImpl::preprocess_buffer (const std::string &buffer,
+                                    const std::string &filename,
+                                    const std::string &stdoslpath,
+                                    const std::vector<std::string> &defines,
+                                    const std::vector<std::string> &includepaths,
+                                    std::string &result)
+{
+    std::string instring;
+    if (!stdoslpath.empty())
+        instring = OIIO::Strutil::sprintf("#include \"%s\"\n", stdoslpath);
+    else
+        instring = "\n";
+    instring += buffer;
+    std::unique_ptr<llvm::MemoryBuffer> mbuf (llvm::MemoryBuffer::getMemBuffer(instring, filename));
+
+    clang::CompilerInstance inst;
+
+    // Set up error capture for the preprocessor
+    std::string preproc_errors;
+    llvm::raw_string_ostream errstream(preproc_errors);
+    clang::DiagnosticOptions *diagOptions = new clang::DiagnosticOptions();
+    clang::TextDiagnosticPrinter *diagPrinter =
+        new clang::TextDiagnosticPrinter(errstream, diagOptions);
+    llvm::IntrusiveRefCntPtr<clang::DiagnosticIDs> diagIDs(new clang::DiagnosticIDs);
+    clang::DiagnosticsEngine *diagEngine =
+        new clang::DiagnosticsEngine(diagIDs, diagOptions, diagPrinter);
+    inst.setDiagnostics(diagEngine);
+
+    const std::shared_ptr<clang::TargetOptions> targetopts =
+          std::make_shared<clang::TargetOptions>(inst.getTargetOpts());
+    targetopts->Triple = llvm::sys::getDefaultTargetTriple();
+    clang::TargetInfo *target =
+        clang::TargetInfo::CreateTargetInfo(inst.getDiagnostics(), targetopts);
+
+    inst.setTarget(target);
+
+    inst.createFileManager();
+    inst.createSourceManager(inst.getFileManager());
+    clang::SourceManager &sm = inst.getSourceManager();
+    sm.setMainFileID (sm.createFileID(std::move(mbuf), clang::SrcMgr::C_User));
+
+    inst.getPreprocessorOutputOpts().ShowCPP = 1;
+    inst.getPreprocessorOutputOpts().ShowMacros = 0;
+    inst.getPreprocessorOutputOpts().ShowComments = 0;
+    inst.getPreprocessorOutputOpts().ShowLineMarkers = 1;
+    inst.getPreprocessorOutputOpts().ShowMacroComments = 0;
+    inst.getPreprocessorOutputOpts().ShowIncludeDirectives = 0;
+
+    clang::HeaderSearchOptions &headerOpts = inst.getHeaderSearchOpts();
+    headerOpts.UseBuiltinIncludes = 0;
+    headerOpts.UseStandardSystemIncludes = 0;
+    headerOpts.UseStandardCXXIncludes = 0;
+    std::string directory = OIIO::Filesystem::parent_path(filename);
+    if (directory.empty())
+        directory = OIIO::Filesystem::current_path();
+    headerOpts.AddPath (directory, clang::frontend::Angled, false, true);
+    for (auto&& inc : includepaths) {
+        headerOpts.AddPath (inc, clang::frontend::Angled,
+                            false /* not a framework */,
+                            true /* ignore sys root */);
+    }
+
+    clang::PreprocessorOptions &preprocOpts = inst.getPreprocessorOpts();
+    preprocOpts.UsePredefines = 0;
+    preprocOpts.addMacroDef (OIIO::Strutil::sprintf("OSL_VERSION_MAJOR=%d",
+                                             OSL_LIBRARY_VERSION_MAJOR).c_str());
+    preprocOpts.addMacroDef (OIIO::Strutil::sprintf("OSL_VERSION_MINOR=%d",
+                                             OSL_LIBRARY_VERSION_MINOR).c_str());
+    preprocOpts.addMacroDef (OIIO::Strutil::sprintf("OSL_VERSION_PATCH=%d",
+                                             OSL_LIBRARY_VERSION_PATCH).c_str());
+    preprocOpts.addMacroDef (OIIO::Strutil::sprintf("OSL_VERSION=%d",
+                                             OSL_LIBRARY_VERSION_CODE).c_str());
+    for (auto&& d : defines) {
+        if (d[1] == 'D')
+            preprocOpts.addMacroDef (d.c_str()+2);
+        else if (d[1] == 'U')
+            preprocOpts.addMacroUndef (d.c_str()+2);
+    }
+
+    inst.getLangOpts().LineComment = 1;
+    inst.createPreprocessor(clang::TU_Prefix);
+
+    llvm::raw_string_ostream ostream(result);
+    diagPrinter->BeginSourceFile (inst.getLangOpts(), &inst.getPreprocessor());
+    clang::DoPrintPreprocessedInput (inst.getPreprocessor(),
+                                     &ostream, inst.getPreprocessorOutputOpts());
+    diagPrinter->EndSourceFile ();
+
+    if (preproc_errors.size()) {
+        while (preproc_errors.size() &&
+               preproc_errors[preproc_errors.size()-1] == '\n')
+            preproc_errors.erase (preproc_errors.size()-1);
+        error (ustring(), -1, "%s", preproc_errors.c_str());
+        return false;
+    }
+    return true;
+}
+
+#endif
+
+
 
 void
 OSLCompilerImpl::read_compile_options (const std::vector<std::string> &options,
@@ -322,6 +415,8 @@ OSLCompilerImpl::read_compile_options (const std::vector<std::string> &options,
             m_optimizelevel = 1;
         } else if (options[i] == "-O2") {
             m_optimizelevel = 2;
+        } else if (options[i] == "-Werror") {
+            m_err_on_warning = true;
         } else if (options[i].c_str()[0] == '-' && options[i].size() > 2) {
             // options meant for the preprocessor
             if (options[i].c_str()[1] == 'D' || options[i].c_str()[1] == 'U')
@@ -330,6 +425,82 @@ OSLCompilerImpl::read_compile_options (const std::vector<std::string> &options,
                 includepaths.push_back(options[i].substr(2));
         }
     }
+}
+
+
+
+// Guess the path for stdosl.h. This is only called if no explicit
+// stdoslpath is given to the compile command.
+static string_view
+find_stdoslpath (const std::vector<std::string>& includepaths)
+{
+    // Try the user-supplied include paths first
+    for (auto& dir : includepaths) {
+        std::string path = dir + "/stdosl.h";
+        if (OIIO::Filesystem::exists (path))
+            return ustring(path);
+    }
+
+    // If that doesn't work, look in a bunch of likely places.
+
+    std::string install_loc = OIIO::Strutil::sprintf("%s/stdosl.h",
+                                                     OSL_SHADER_INSTALL_DIR);
+    if (OIIO::Filesystem::exists(install_loc))
+        return ustring(install_loc);
+
+    std::string myprefix = OIIO::Filesystem::parent_path(
+            OIIO::Filesystem::parent_path(OIIO::Sysutil::this_program_path()));
+
+    // List of likely prefixes and suffixes, in order of preference
+    std::string prefixes[] = {
+        OIIO::Sysutil::getenv("OSL_ROOT_DIR"),
+        OIIO::Sysutil::getenv("OSLHOME"),
+        myprefix,
+        OIIO::Filesystem::parent_path(myprefix)
+    };
+    std::string suffixes[] = {
+        "/share/OSL/shaders/stdosl.h",
+        "/share/shaders/stdosl.h",
+        "/lib/OSL/include/std/stdosl.h",
+        "/lib/osl/include/std/stdosl.h",
+        "/shaders/stdosl.h" /*old*/
+    };
+    for (auto& dir : prefixes) {
+        if (! dir.empty() && OIIO::Filesystem::is_directory(dir)) {
+            // For each prefix, check likely suffixes, in order of preference
+            for (auto& s : suffixes) {
+                if (OIIO::Filesystem::exists (dir + s))
+                    return ustring(dir + s);
+            }
+        }
+    }
+
+    // Try looking for "oslc" binary in the $PATH (in case the executable
+    // running this code is not the actual oslc), and if so, look in places
+    // relative to that.
+    std::vector<std::string> exec_path_dirs;
+    OIIO::Filesystem::searchpath_split (OIIO::Sysutil::getenv("PATH"),
+                                        exec_path_dirs, true);
+#ifdef _WIN32
+    std::string oslcbin = "oslc.exe";
+#else
+    std::string oslcbin = "oslc";
+#endif
+    oslcbin = OIIO::Filesystem::searchpath_find (oslcbin, exec_path_dirs);
+    if (oslcbin.size()) {
+        std::string dir = OIIO::Filesystem::parent_path(oslcbin);  // the bin dir of our program
+        dir = OIIO::Filesystem::parent_path(dir);  // now the parent dir
+        if (! dir.empty() && OIIO::Filesystem::is_directory(dir)) {
+            // For each prefix, check likely suffixes, in order of preference
+            for (auto& s : suffixes) {
+                if (OIIO::Filesystem::exists (dir + s))
+                    return ustring(dir + s);
+            }
+        }
+    }
+
+    // Give up
+    return string_view();
 }
 
 
@@ -346,26 +517,16 @@ OSLCompilerImpl::compile (string_view filename,
 
     std::vector<std::string> defines;
     std::vector<std::string> includepaths;
-#if OIIO_VERSION >= 10604
     m_cwd = OIIO::Filesystem::current_path();
-#else
-    m_cwd = boost::filesystem::current_path().string();
-#endif
     m_main_filename = filename;
+    clear_filecontents_cache();
+
+    read_compile_options (options, defines, includepaths);
 
     // Determine where the installed shader include directory is, and
     // look for ../shaders/stdosl.h and force it to include.
     if (stdoslpath.empty()) {
-        // look in $OSLHOME/shaders
-        const char *OSLHOME = getenv ("OSLHOME");
-        if (OSLHOME && OSLHOME[0]) {
-            std::string path = std::string(OSLHOME) + "/shaders";
-            if (OIIO::Filesystem::exists (path)) {
-                path = path + "/stdosl.h";
-                if (OIIO::Filesystem::exists (path))
-                    stdoslpath = ustring(path);
-            }
-        }
+        stdoslpath = find_stdoslpath(includepaths);
     }
     if (stdoslpath.empty() || ! OIIO::Filesystem::exists(stdoslpath))
         warning (ustring(filename), 0, "Unable to find \"stdosl.h\"");
@@ -374,8 +535,6 @@ OSLCompilerImpl::compile (string_view filename,
         includepaths.push_back (OIIO::Filesystem::parent_path (stdoslpath));
     }
 
-    read_compile_options (options, defines, includepaths);
-
     std::string preprocess_result;
     if (! preprocess_file (filename, stdoslpath,
                            defines, includepaths, preprocess_result)) {
@@ -383,6 +542,9 @@ OSLCompilerImpl::compile (string_view filename,
     } else if (m_preprocess_only) {
         std::cout << preprocess_result;
     } else {
+        // Thread safety with the lexer/parser
+        std::lock_guard<std::mutex> lock (oslcompiler_mutex);
+        oslcompiler = this;
         bool parseerr = osl_parse_buffer (preprocess_result);
         if (! parseerr) {
             if (shader())
@@ -415,7 +577,7 @@ OSLCompilerImpl::compile (string_view filename,
             OIIO::Filesystem::open (oso_output, m_output_filename);
             if (! oso_output.good()) {
                 error (ustring(), 0, "Could not open \"%s\"",
-                       m_output_filename.c_str());
+                       m_output_filename);
                 return false;
             }
             ASSERT (m_osofile == NULL);
@@ -425,7 +587,7 @@ OSLCompilerImpl::compile (string_view filename,
             ASSERT (m_osofile == NULL);
         }
 
-        oslcompiler = NULL;
+        oslcompiler = nullptr;
     }
 
     return ! error_encountered();
@@ -437,37 +599,27 @@ bool
 OSLCompilerImpl::compile_buffer (string_view sourcecode,
                                  std::string &osobuffer,
                                  const std::vector<std::string> &options,
-                                 string_view stdoslpath)
+                                 string_view stdoslpath,
+                                 string_view filename)
 {
-    string_view filename ("<buffer>");
-
-#if OIIO_VERSION >= 10604
-    m_cwd = OIIO::Filesystem::current_path();
-#else
-    m_cwd = boost::filesystem::current_path().string();
-#endif
-    m_main_filename = filename;
-
-    // Determine where the installed shader include directory is, and
-    // look for ../shaders/stdosl.h and force it to include.
-    if (stdoslpath.empty()) {
-        // look in $OSLHOME/shaders
-        const char *OSLHOME = getenv ("OSLHOME");
-        if (OSLHOME && OSLHOME[0]) {
-            std::string path = std::string(OSLHOME) + "/shaders";
-            if (OIIO::Filesystem::exists (path)) {
-                path = path + "/stdosl.h";
-                if (OIIO::Filesystem::exists (path))
-                    stdoslpath = ustring(path);
-            }
-        }
-    }
-    if (stdoslpath.empty() || ! OIIO::Filesystem::exists(stdoslpath))
-        warning (ustring(filename), 0, "Unable to find \"stdosl.h\"");
+    if (filename.empty())
+        filename = string_view("<buffer>");
 
     std::vector<std::string> defines;
     std::vector<std::string> includepaths;
     read_compile_options (options, defines, includepaths);
+
+    m_cwd = OIIO::Filesystem::current_path();
+    m_main_filename = filename;
+    clear_filecontents_cache();
+
+    // Determine where the installed shader include directory is, and
+    // look for ../shaders/stdosl.h and force it to include.
+    if (stdoslpath.empty()) {
+        stdoslpath = find_stdoslpath(includepaths);
+    }
+    if (stdoslpath.empty() || ! OIIO::Filesystem::exists(stdoslpath))
+        warning (ustring(filename), 0, "Unable to find \"stdosl.h\"");
 
     std::string preprocess_result;
     if (! preprocess_buffer (sourcecode, filename, stdoslpath,
@@ -476,6 +628,9 @@ OSLCompilerImpl::compile_buffer (string_view sourcecode,
     } else if (m_preprocess_only) {
         std::cout << preprocess_result;
     } else {
+        // Thread safety with the lexer/parser
+        std::lock_guard<std::mutex> lock (oslcompiler_mutex);
+        oslcompiler = this;
         bool parseerr = osl_parse_buffer (preprocess_result);
         if (! parseerr) {
             if (shader())
@@ -501,9 +656,11 @@ OSLCompilerImpl::compile_buffer (string_view sourcecode,
         }
  
         if (! error_encountered()) {
-            m_output_filename = "<buffer>";
+            if (m_output_filename.empty())
+                m_output_filename = default_output_filename ();
 
             std::ostringstream oso_output;
+            oso_output.imbue (std::locale::classic());  // force C locale
             ASSERT (m_osofile == NULL);
             m_osofile = &oso_output;
 
@@ -512,7 +669,7 @@ OSLCompilerImpl::compile_buffer (string_view sourcecode,
             ASSERT (m_osofile == NULL);
         }
 
-        oslcompiler = NULL;
+        oslcompiler = nullptr;
     }
 
     return ! error_encountered();
@@ -523,6 +680,10 @@ OSLCompilerImpl::compile_buffer (string_view sourcecode,
 struct GlobalTable {
     const char *name;
     TypeSpec type;
+    bool readonly;
+
+    GlobalTable (const char *name, TypeSpec type, bool readonly=true)
+        : name(name), type(type), readonly(readonly) {}
 };
 
 
@@ -530,34 +691,24 @@ void
 OSLCompilerImpl::initialize_globals ()
 {
     static GlobalTable globals[] = {
-        { "P", TypeDesc::TypePoint },
-        { "I", TypeDesc::TypeVector },
-        { "N", TypeDesc::TypeNormal },
+        { "P", TypeDesc::TypePoint, false },
+        { "I", TypeDesc::TypeVector, false },
+        { "N", TypeDesc::TypeNormal, false },
         { "Ng", TypeDesc::TypeNormal },
         { "u", TypeDesc::TypeFloat },
         { "v", TypeDesc::TypeFloat },
         { "dPdu", TypeDesc::TypeVector },
         { "dPdv", TypeDesc::TypeVector },
-    #if 0
-        // Light variables -- we don't seem to be on a route to support this
-        // kind of light shader, so comment these out for now.
-        { "L", TypeDesc::TypeVector },
-        { "Cl", TypeDesc::TypeColor },
-        { "Ns", TypeDesc::TypeNormal },
-        { "Pl", TypeDesc::TypePoint },
-        { "Nl", TypeDesc::TypeNormal },
-    #endif
         { "Ps", TypeDesc::TypePoint },
-        { "Ci", TypeSpec (TypeDesc::TypeColor, true) },
+        { "Ci", TypeSpec (TypeDesc::TypeColor, true), false },
         { "time", TypeDesc::TypeFloat },
         { "dtime", TypeDesc::TypeFloat },
-        { "dPdtime", TypeDesc::TypeVector },
-        { NULL }
+        { "dPdtime", TypeDesc::TypeVector }
     };
 
-    for (int i = 0;  globals[i].name;  ++i) {
-        Symbol *s = new Symbol (ustring(globals[i].name), globals[i].type,
-                                SymTypeGlobal);
+    for (auto& g : globals) {
+        Symbol *s = new Symbol (ustring(g.name), g.type, SymTypeGlobal);
+        s->readonly (g.readonly);
         symtab().insert (s);
     }
 }
@@ -611,10 +762,10 @@ OSLCompilerImpl::write_oso_const_value (const ConstantSymbol *sym) const
             oso ("%d%s", sym->intval(i), nelements>1 ? " " : "");
     else if (elemtype == TypeDesc::FLOAT)
         for (int i = 0;  i < nelements;  ++i)
-            oso ("%.8g%s", sym->floatval(i), nelements>1 ? " " : "");
+            oso ("%.9g%s", sym->floatval(i), nelements>1 ? " " : "");
     else if (equivalent (elemtype, TypeDesc::TypeVector))
         for (int i = 0;  i < nelements;  ++i)
-            oso ("%.8g %.8g %.8g%s", sym->vecval(i)[0], sym->vecval(i)[1],
+            oso ("%.9g %.9g %.9g%s", sym->vecval(i)[0], sym->vecval(i)[1],
                  sym->vecval(i)[2], nelements>1 ? " " : "");
     else {
         ASSERT (0 && "Don't know how to output this constant type");
@@ -713,7 +864,7 @@ OSLCompilerImpl::write_oso_symbol (const Symbol *sym)
         // FIXME
         const SymPtrSet &deps (m_symdeps[sym]);
         std::vector<const Symbol *> inputdeps;
-        BOOST_FOREACH (const Symbol *d, deps)
+        for (auto&& d : deps)
             if (d->symtype() == SymTypeParam ||
                   d->symtype() == SymTypeOutputParam ||
                   d->symtype() == SymTypeGlobal ||
@@ -767,12 +918,12 @@ OSLCompilerImpl::write_oso_file (const std::string &outfilename,
     oso ("\n");
 
     // Output params, so they are first
-    BOOST_FOREACH (const Symbol *s, symtab()) {
+    for (auto&& s : symtab()) {
         if (s->symtype() == SymTypeParam || s->symtype() == SymTypeOutputParam)
             write_oso_symbol (s);
     }
     // Output globals, locals, temps, const
-    BOOST_FOREACH (const Symbol *s, symtab()) {
+    for (auto&& s : symtab()) {
         if (s->symtype() == SymTypeLocal || s->symtype() == SymTypeTemp ||
             s->symtype() == SymTypeGlobal || s->symtype() == SymTypeConst) {
             // Don't bother writing symbols that are never used
@@ -786,37 +937,37 @@ OSLCompilerImpl::write_oso_file (const std::string &outfilename,
     int lastline = -1;
     ustring lastfile;
     ustring lastmethod ("___uninitialized___");
-    for (OpcodeVec::iterator op = m_ircode.begin(); op != m_ircode.end();  ++op) {
-        if (lastmethod != op->method()) {
-            oso ("code %s\n", op->method().c_str());
-            lastmethod = op->method();
+    for (auto& op : m_ircode) {
+        if (lastmethod != op.method()) {
+            oso ("code %s\n", op.method());
+            lastmethod = op.method();
             lastfile = ustring();
             lastline = -1;
         }
 
-        if (/*m_debug &&*/ op->sourcefile()) {
-            ustring file = op->sourcefile();
-            int line = op->sourceline();
+        if (/*m_debug &&*/ !op.sourcefile().empty()) {
+            ustring file = op.sourcefile();
+            int line = op.sourceline();
             if (file != lastfile || line != lastline)
-                oso ("# %s:%d\n# %s\n", file.c_str(), line,
-                     retrieve_source (file, line).c_str());
+                oso ("# %s:%d\n# %s\n", file, line,
+                     retrieve_source (file, line));
         }
 
         // Op name
-        oso ("\t%s", op->opname().c_str());
+        oso ("\t%s", op.opname());
 
         // Register arguments
-        if (op->nargs())
-            oso (op->opname().length() < 8 ? "\t\t" : "\t");
-        for (int i = 0;  i < op->nargs();  ++i) {
-            int arg = op->firstarg() + i;
-            oso ("%s ", m_opargs[arg]->dealias()->mangled().c_str());
+        if (op.nargs())
+            oso (op.opname().length() < 8 ? "\t\t" : "\t");
+        for (int i = 0;  i < op.nargs();  ++i) {
+            int arg = op.firstarg() + i;
+            oso ("%s ", m_opargs[arg]->dealias()->mangled());
         }
 
         // Jump targets
         for (size_t i = 0;  i < Opcode::max_jumps;  ++i)
-            if (op->jump(i) >= 0)
-                oso ("%d ", op->jump(i));
+            if (op.jump(i) >= 0)
+                oso ("%d ", op.jump(i));
 
         //
         // Opcode Hints
@@ -827,27 +978,27 @@ OSLCompilerImpl::write_oso_file (const std::string &outfilename,
         // %filename and %line document the source code file and line that
         // contained code that generated this op.  To avoid clutter, we
         // only output these hints when they DIFFER from the previous op.
-        if (op->sourcefile()) {
-            if (op->sourcefile() != lastfile) {
-                lastfile = op->sourcefile();
-                oso ("%c%%filename{\"%s\"}", firsthint ? '\t' : ' ', lastfile.c_str());
+        if (!op.sourcefile().empty()) {
+            if (op.sourcefile() != lastfile) {
+                lastfile = op.sourcefile();
+                oso ("%c%%filename{\"%s\"}", firsthint ? '\t' : ' ', lastfile);
                 firsthint = false;
             }
-            if (op->sourceline() != lastline) {
-                lastline = op->sourceline();
+            if (op.sourceline() != lastline) {
+                lastline = op.sourceline();
                 oso ("%c%%line{%d}", firsthint ? '\t' : ' ', lastline);
                 firsthint = false;
             }
         }
 
         // %argrw documents which arguments are read, written, or both (rwW).
-        if (op->nargs()) {
+        if (op.nargs()) {
             oso ("%c%%argrw{\"", firsthint ? '\t' : ' ');
-            for (int i = 0;  i < op->nargs();  ++i) {
-                if (op->argwrite(i))
-                    oso (op->argread(i) ? "W" : "w");
+            for (int i = 0;  i < op.nargs();  ++i) {
+                if (op.argwrite(i))
+                    oso (op.argread(i) ? "W" : "w");
                 else
-                    oso (op->argread(i) ? "r" : "-");
+                    oso (op.argread(i) ? "r" : "-");
             }
             oso ("\"}");
             firsthint = false;
@@ -855,11 +1006,11 @@ OSLCompilerImpl::write_oso_file (const std::string &outfilename,
 
         // %argderivs documents which arguments have derivs taken of
         // them by the op.
-        if (op->argtakesderivs_all()) {
+        if (op.argtakesderivs_all()) {
             oso (" %%argderivs{");
             int any = 0;
-            for (int i = 0;  i < op->nargs();  ++i)
-                if (op->argtakesderivs(i)) {
+            for (int i = 0;  i < op.nargs();  ++i)
+                if (op.argtakesderivs(i)) {
                     if (any++)
                         oso (",");
                     oso ("%d", i);
@@ -880,43 +1031,71 @@ OSLCompilerImpl::write_oso_file (const std::string &outfilename,
 
 
 
-std::string
+void
+OSLCompilerImpl::clear_filecontents_cache()
+{
+    m_filecontents_map.clear();
+    m_last_sourcefile.clear();
+    m_last_filecontents = nullptr;
+    m_last_sourceline = 1;  // note we call the first line "1" for users
+    m_last_sourceline_offset = 0;
+}
+
+
+
+string_view
 OSLCompilerImpl::retrieve_source (ustring filename, int line)
 {
-    // If we don't already have the file open, open it
-    if (filename != m_last_sourcefile) {
-        // If we have another file open, close that one
-        if (m_sourcefile)
-            fclose (m_sourcefile);
-        m_last_sourcefile = filename;
-        m_sourcefile = OIIO::Filesystem::fopen (filename, "r");
-        if (! m_sourcefile) {
-            m_last_sourcefile = ustring();
-            return "<not found>";
+    // If we don't have a valid "last", look it up in the cache.
+    if (filename != m_last_sourcefile || !m_last_filecontents) {
+        m_last_sourceline = 1;
+        m_last_sourceline_offset = 0;
+        auto found = m_filecontents_map.find (filename);
+        if (found == m_filecontents_map.end()) {
+            // If it wasn't in the cache, read the file and add it.
+            std::string contents;
+            bool ok = OIIO::Filesystem::read_text_file (filename, contents);
+            if (ok) {
+                m_last_sourcefile = filename;
+                m_filecontents_map[filename] = std::move(contents);
+                m_last_filecontents = &m_filecontents_map[filename];
+            } else {
+                m_last_sourcefile = ustring();
+                m_last_filecontents = nullptr;
+                return "<file not found>";
+            }
+        } else {
+            m_last_sourcefile = filename;
+            m_last_filecontents = &found->second;
         }
     }
 
-    // If we want something *before* the last line read in the open file,
-    // rewind to the beginning.
-    if (m_last_sourceline > line) {
-        rewind (m_sourcefile);
-        m_last_sourceline = 0;
-    }
-
     // Now read lines up to and including the file we want.
-    char buf[10240];
-    while (m_last_sourceline < line) {
-        if (fgets (buf, sizeof(buf), m_sourcefile))
-            ++m_last_sourceline;
-        else
-            break;
+    OIIO::string_view s (*m_last_filecontents);
+    int orig_sourceline = line;
+    if (line >= m_last_sourceline) {
+        // Shortcut: the line we want is in the same file as the last read,
+        // and at least as far in the file. Start the search from where we
+        // left off last time.
+        s.remove_prefix (m_last_sourceline_offset);
+        line -= m_last_sourceline - 1;
+    } else {
+        // If we have to backtrack at all, backtrack to the file start.
+        m_last_sourceline_offset = 0;
+        m_last_sourceline = 1;
     }
-
-    // strip trailing newline
-    if (buf[strlen(buf)-1] == '\n')
-        buf[strlen(buf)-1] = '\0';
-
-    return std::string (buf);
+    size_t offset = m_last_sourceline_offset;
+    for ( ; line > 1; --line) {
+        size_t p = s.find_first_of ('\n');
+        if (p == OIIO::string_view::npos)
+            return "<line not found>";
+        s.remove_prefix (p+1);
+        offset += p+1;
+    }
+    s = s.substr (0, s.find_first_of ('\n'));
+    m_last_sourceline_offset = offset;
+    m_last_sourceline = orig_sourceline;
+    return s;
 }
 
 
@@ -1001,8 +1180,9 @@ OSLCompilerImpl::struct_field_pair (const StructSpec *structspec, int fieldnum,
 
 
 
-/// Verify that the given symbol (written by the given op) is legal to
-/// be written.
+/// Verify that the given symbol (written by the given op) is legal to be
+/// written. If writeable, it's writeable, We don't try to enforce
+/// differences in policy per shader types.
 void
 OSLCompilerImpl::check_write_legality (const Opcode &op, int opnum,
                                        const Symbol *sym)
@@ -1017,12 +1197,9 @@ OSLCompilerImpl::check_write_legality (const Opcode &op, int opnum,
     if (sym->symtype() == SymTypeParam && 
         (opnum < sym->initbegin() || opnum >= sym->initend())) {
         error (op.sourcefile(), op.sourceline(),
-               "Cannot write to input parameter '%s' (op %d)",
-               sym->name().c_str(), opnum);
+               "cannot write to non-output parameter \"%s\"",
+               sym->name());
     }
-
-    // FIXME -- check for writing to globals.  But it's tricky, depends on
-    // what kind of shader we are.
 }
 
 
@@ -1032,7 +1209,7 @@ OSLCompilerImpl::check_for_illegal_writes ()
 {
     // For each op, make sure any arguments it writes are legal to do so
     int opnum = 0;
-    BOOST_FOREACH (Opcode &op, m_ircode) {
+    for (auto&& op : m_ircode) {
         for (int a = 0;  a < op.nargs();  ++a) {
             SymbolPtr s = m_opargs[op.firstarg()+a];
             if (op.argwrite(a))
@@ -1054,7 +1231,7 @@ OSLCompilerImpl::track_variable_lifetimes (const OpcodeVec &code,
                                            std::vector<int> *bblockids)
 {
     // Clear the lifetimes for all symbols
-    BOOST_FOREACH (Symbol *s, allsyms)
+    for (auto&& s : allsyms)
         s->clear_rw ();
 
     // Keep track of the nested loops we're inside. We track them by pairs
@@ -1066,7 +1243,7 @@ OSLCompilerImpl::track_variable_lifetimes (const OpcodeVec &code,
 
     // For each op, mark its arguments as being used at that op
     int opnum = 0;
-    BOOST_FOREACH (const Opcode &op, code) {
+    for (auto&& op : code) {
         if (op.opname() == op_for || op.opname() == op_while ||
                 op.opname() == op_dowhile) {
             // If this is a loop op, we need to mark its control variable
@@ -1093,7 +1270,7 @@ OSLCompilerImpl::track_variable_lifetimes (const OpcodeVec &code,
 
             // Adjust lifetimes of symbols whose values need to be preserved
             // between loop iterations.
-            BOOST_FOREACH (intpair oprange, loop_bounds) {
+            for (auto oprange : loop_bounds) {
                 int loopcond = oprange.first;
                 int loopend = oprange.second;
                 DASSERT (s->firstuse() <= loopend);
@@ -1141,7 +1318,7 @@ add_dependency (SymDependencyMap &dmap, const Symbol *A, const Symbol *B)
 #ifdef DEBUG_SYMBOL_DEPENDENCIES
     // Perform unification -- all of B's dependencies are now
     // dependencies of A.
-    BOOST_FOREACH (const Symbol *r, dmap[B])
+    for (auto&& r : dmap[B])
         dmap[A].insert (r);
 #endif
 }
@@ -1150,7 +1327,7 @@ add_dependency (SymDependencyMap &dmap, const Symbol *A, const Symbol *B)
 static void
 mark_symbol_derivatives (SymDependencyMap &dmap, SymPtrSet &visited, const Symbol *sym)
 {
-    BOOST_FOREACH (const Symbol *r, dmap[sym]) {
+    for (auto&& r : dmap[sym]) {
 		if (visited.find(r) == visited.end()) {
 			visited.insert(r);
 
@@ -1219,9 +1396,9 @@ OSLCompilerImpl::track_variable_dependencies ()
 
         bool deriv = op->argtakesderivs_all();
         // For each sym written by the op...
-        BOOST_FOREACH (const Symbol *wsym, written) {
+        for (auto&& wsym : written) {
             // For each sym read by the op...
-            BOOST_FOREACH (const Symbol *rsym, read) {
+            for (auto&& rsym : read) {
                 if (rsym->symtype() != SymTypeConst)
                     add_dependency (m_symdeps, wsym, rsym);
             }
@@ -1245,9 +1422,9 @@ OSLCompilerImpl::track_variable_dependencies ()
 
     std::cerr << "track_variable_dependencies\n";
     std::cerr << "\nDependencies:\n";
-    BOOST_FOREACH (SymDependencyMap::value_type &m, m_symdeps) {
+    for (auto&& m, m_symdeps) {
         std::cerr << m.first->mangled() << " depends on ";
-        BOOST_FOREACH (const Symbol *d, m.second)
+        for (auto&& d : m.second)
             std::cerr << d->mangled() << ' ';
         std::cerr << "\n";
     }
@@ -1255,14 +1432,14 @@ OSLCompilerImpl::track_variable_dependencies ()
 
     // Invert the dependency
     SymDependencyMap influences;
-    BOOST_FOREACH (SymDependencyMap::value_type &m, m_symdeps)
-        BOOST_FOREACH (const Symbol *d, m.second)
+    for (auto&& m, m_symdeps)
+        for (auto&& d : m.second)
             influences[d].insert (m.first);
 
     std::cerr << "\nReverse dependencies:\n";
-    BOOST_FOREACH (SymDependencyMap::value_type &m, influences) {
+    for (auto&& m, influences) {
         std::cerr << m.first->mangled() << " contributes to ";
-        BOOST_FOREACH (const Symbol *d, m.second)
+        for (auto&& d : m.second)
             std::cerr << d->mangled() << ' ';
         std::cerr << "\n";
     }

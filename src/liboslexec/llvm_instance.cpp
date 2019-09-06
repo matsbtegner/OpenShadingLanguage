@@ -27,8 +27,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include <cmath>
-
-#include <boost/unordered_map.hpp>
+#include <iostream>
+#include <unordered_map>
+#include <unordered_set>
+#include <bitset>
 
 #include <OpenImageIO/timer.h>
 #include <OpenImageIO/sysutil.h>
@@ -110,7 +112,10 @@ Schematically, we want to create code that resembles the following:
 */
 
 extern int osl_llvm_compiled_ops_size;
-extern char osl_llvm_compiled_ops_block[];
+extern unsigned char osl_llvm_compiled_ops_block[];
+
+extern int osl_llvm_compiled_ops_cuda_size;
+extern unsigned char osl_llvm_compiled_ops_cuda_block[];
 
 using namespace OSL::pvt;
 
@@ -136,7 +141,7 @@ struct HelperFuncRecord {
         : argtypes(argtypes), function(function) {}
 };
 
-typedef boost::unordered_map<std::string,HelperFuncRecord> HelperFuncMap;
+typedef std::unordered_map<std::string,HelperFuncRecord> HelperFuncMap;
 HelperFuncMap llvm_helper_function_map;
 atomic_int llvm_helper_function_map_initialized (0);
 spin_mutex llvm_helper_function_map_mutex;
@@ -150,7 +155,7 @@ initialize_llvm_helper_function_map ()
     if (llvm_helper_function_map_initialized)
         return;  // already done
     spin_lock lock (llvm_helper_function_map_mutex);
-    if (llvm_helper_function_map_initialized())
+    if (llvm_helper_function_map_initialized)
         return;
 #define DECL(name,signature) \
     llvm_helper_function_map[#name] = HelperFuncRecord(signature,name); \
@@ -268,7 +273,13 @@ BackendLLVM::llvm_type_groupdata ()
         ++order;
         for (int i = 0; i < nuserdata; ++i) {
             TypeDesc type = types[i];
-            int n = type.numelements() * 3;   // always make deriv room
+            // NB: Userdata derivs are not currently supported in OptiX, since
+            //     making room for them in the GroupData struct can result in a
+            //     large per-thread memory allocation, which could negatively
+            //     impact performance.
+            int n = (! use_optix())
+                ? type.numelements() * 3  // make room for derivs by default
+                : type.numelements();
             type.arraylen = n;
             fields.push_back (llvm_type (type));
             // Alignment
@@ -323,7 +334,7 @@ BackendLLVM::llvm_type_groupdata ()
         std::cout << " Group struct had " << order << " fields, total size "
                   << offset << "\n\n";
 
-    std::string groupdataname = Strutil::format("Groupdata_%llu",
+    std::string groupdataname = Strutil::sprintf("Groupdata_%llu",
                                                 (long long unsigned int)group().name().hash());
     m_llvm_type_groupdata = ll.type_struct (fields, groupdataname);
 
@@ -365,12 +376,12 @@ BackendLLVM::llvm_type_closure_component_ptr ()
 
 
 void
-BackendLLVM::llvm_assign_initial_value (const Symbol& sym)
+BackendLLVM::llvm_assign_initial_value (const Symbol& sym, bool force)
 {
     // Don't write over connections!  Connection values are written into
     // our layer when the earlier layer is run, as part of its code.  So
     // we just don't need to initialize it here at all.
-    if (sym.valuesource() == Symbol::ConnectedVal &&
+    if (!force && sym.valuesource() == Symbol::ConnectedVal &&
           !sym.typespec().is_closure_based())
         return;
     if (sym.typespec().is_closure_based() && sym.symtype() == SymTypeGlobal)
@@ -430,42 +441,52 @@ BackendLLVM::llvm_assign_initial_value (const Symbol& sym)
     // such userdata was available.
     llvm::BasicBlock *after_userdata_block = NULL;
     if (! sym.lockgeom() && ! sym.typespec().is_closure() && ! (sym.symtype() == SymTypeOutputParam)) {
-        int userdata_index = -1;
         ustring symname = sym.name();
         TypeDesc type = sym.typespec().simpletype();
-        for (int i = 0, e = (int)group().m_userdata_names.size(); i < e; ++i) {
-            if (symname == group().m_userdata_names[i] &&
-                    equivalent (type, group().m_userdata_types[i])) {
-                userdata_index = i;
-                break;
-            }
-        }
+
+        int userdata_index = find_userdata_index (sym);
         ASSERT (userdata_index >= 0);
-        std::vector<llvm::Value*> args;
-        args.push_back (sg_void_ptr());
-        args.push_back (ll.constant (symname));
-        args.push_back (ll.constant (type));
-        args.push_back (ll.constant ((int) group().m_userdata_derivs[userdata_index]));
-        args.push_back (groupdata_field_ptr (2 + userdata_index)); // userdata data ptr
-        args.push_back (ll.constant ((int) sym.has_derivs()));
-        args.push_back (llvm_void_ptr (sym));
-        args.push_back (ll.constant (sym.derivsize()));
-        args.push_back (ll.void_ptr (userdata_initialized_ref(userdata_index)));
-        args.push_back (ll.constant (userdata_index));
+
+        llvm::Value* name_arg = NULL;
+        if (use_optix()) {
+            // We need to make a DeviceString for the parameter name
+#ifdef OIIO_HAS_SPRINTF
+            ustring arg_name = ustring::sprintf ("osl_paramname_%s_%d", symname, sym.layer());
+#else
+            ustring arg_name = ustring::format ("osl_paramname_%s_%d", symname, sym.layer());
+#endif
+            Symbol symname_const (arg_name, TypeDesc::TypeString, SymTypeConst);
+            symname_const.data (&symname);
+            name_arg = llvm_load_device_string (symname_const);
+        } else {
+            name_arg = ll.constant (symname);
+        }
+
+        llvm::Value* args[] = {
+            sg_void_ptr(),
+            name_arg,
+            ll.constant (type),
+            ll.constant ((int) group().m_userdata_derivs[userdata_index]),
+            groupdata_field_ptr (2 + userdata_index), // userdata data ptr
+            ll.constant ((int) sym.has_derivs()),
+            llvm_void_ptr (sym),
+            ll.constant (sym.derivsize()),
+            ll.void_ptr (userdata_initialized_ref(userdata_index)),
+            ll.constant (userdata_index),
+        };
         llvm::Value *got_userdata =
-            ll.call_function ("osl_bind_interpolated_param",
-                              &args[0], args.size());
+            ll.call_function ("osl_bind_interpolated_param", args);
         if (shadingsys().debug_nan() && type.basetype == TypeDesc::FLOAT) {
             // check for NaN/Inf for float-based types
             int ncomps = type.numelements() * type.aggregate;
             llvm::Value *args[] = { ll.constant(ncomps), llvm_void_ptr(sym),
-                 ll.constant((int)sym.has_derivs()), sg_void_ptr(),
-                 ll.constant(ustring(inst()->shadername())),
-                 ll.constant(0), ll.constant(sym.name()),
-                 ll.constant(0), ll.constant(ncomps),
-                 ll.constant("<get_userdata>")
+                                    ll.constant((int)sym.has_derivs()), sg_void_ptr(),
+                                    ll.constant(ustring(inst()->shadername())),
+                                    ll.constant(0), ll.constant(sym.name()),
+                                    ll.constant(0), ll.constant(ncomps),
+                                    ll.constant("<get_userdata>")
             };
-            ll.call_function ("osl_naninf_check", args, 10);
+            ll.call_function ("osl_naninf_check", args);
         }
         // We will enclose the subsequent initialization of default values
         // or init ops in an "if" so that the extra copies or code don't
@@ -476,7 +497,27 @@ BackendLLVM::llvm_assign_initial_value (const Symbol& sym)
         ll.op_branch (cond_val, no_userdata_block, after_userdata_block);
     }
 
-    if (sym.has_init_ops() && sym.valuesource() == Symbol::DefaultVal) {
+    if (use_optix() && ! sym.typespec().is_closure() && ! sym.typespec().is_string()) {
+        ASSERT (! sym.has_init_ops() && "Init ops are not currently supported in OptiX");
+
+        // If the call to osl_bind_interpolated_param returns 0, the default
+        // value needs to be loaded from a CUDA variable.
+        llvm::Value* cuda_var = getOrAllocateCUDAVariable (sym);
+
+        // memcpy the initial value from the CUDA variable
+        llvm::Value* src = ll.ptr_cast (ll.GEP (cuda_var, 0), ll.type_void_ptr());
+        llvm::Value* dst = llvm_void_ptr (sym);
+
+        TypeDesc t = sym.typespec().simpletype();
+        ll.op_memcpy (dst, src, t.size(), t.basesize());
+    } else if (use_optix() && ! sym.typespec().is_closure()) {
+        // For convenience, we always pack string addresses into the groupdata
+        // struct.
+        int userdata_index = find_userdata_index (sym);
+        llvm::Value* init_val = getOrAllocateCUDAVariable (sym);
+        init_val = ll.ptr_cast (ll.GEP (init_val, 0), ll.type_void_ptr());
+        ll.op_memcpy (groupdata_field_ptr (2 + userdata_index), init_val, 8, 4);
+    } else if (sym.has_init_ops() && sym.valuesource() == Symbol::DefaultVal) {
         // Handle init ops.
         build_llvm_code (sym.initbegin(), sym.initend());
     } else if (! sym.lockgeom() && ! sym.typespec().is_closure()) {
@@ -559,7 +600,7 @@ BackendLLVM::llvm_generate_debugnan (const Opcode &op)
                                 ncheck,
                                 ll.constant(op.opname())
                               };
-        ll.call_function ("osl_naninf_check", args, 10);
+        ll.call_function ("osl_naninf_check", args);
     }
 }
 
@@ -623,8 +664,20 @@ BackendLLVM::llvm_generate_debug_uninit (const Opcode &op)
                                 offset,
                                 ncheck
                               };
-        ll.call_function ("osl_uninit_check", args, 15);
+        ll.call_function ("osl_uninit_check", args);
     }
+}
+
+
+
+void
+BackendLLVM::llvm_generate_debug_op_printf (const Opcode &op)
+{
+    std::ostringstream msg;
+    msg << op.sourcefile() << ':' << op.sourceline() << ' ' << op.opname();
+    for (int i = 0;  i < op.nargs();  ++i)
+        msg << ' ' << opargsym (op, i)->mangled();
+    llvm_gen_debug_printf (msg.str());
 }
 
 
@@ -641,6 +694,8 @@ BackendLLVM::build_llvm_code (int beginop, int endop, llvm::BasicBlock *bb)
         if (opd && opd->llvmgen) {
             if (shadingsys().debug_uninit() /* debug uninitialized vals */)
                 llvm_generate_debug_uninit (op);
+            if (shadingsys().llvm_debug_ops())
+                llvm_generate_debug_op_printf (op);
             bool ok = (*opd->llvmgen) (*this, opnum);
             if (! ok)
                 return false;
@@ -673,7 +728,7 @@ BackendLLVM::build_llvm_init ()
 {
     // Make a group init function: void group_init(ShaderGlobals*, GroupData*)
     // Note that the GroupData* is passed as a void*.
-    std::string unique_name = Strutil::format ("group_%d_init", group().id());
+    std::string unique_name = Strutil::sprintf ("group_%d_init", group().id());
     ll.current_function (
            ll.make_function (unique_name, false,
                              ll.type_void(), // return type
@@ -688,7 +743,7 @@ BackendLLVM::build_llvm_init ()
     ll.new_builder (entry_bb);
 #if 0 /* helpful for debugging */
     if (llvm_debug()) {
-        llvm_gen_debug_printf (Strutil::format("\n\n\n\nGROUP! %s",group().name()));
+        llvm_gen_debug_printf (Strutil::sprintf("\n\n\n\nGROUP! %s",group().name()));
         llvm_gen_debug_printf ("enter group initlayer %d %s %s");                               this->layer(), inst()->layername(), inst()->shadername()));
     }
 #endif
@@ -699,7 +754,9 @@ BackendLLVM::build_llvm_init ()
         ll.op_memset (ll.void_ptr(layer_run_ref(0)), 0, sz, 4 /*align*/);
     }
     int num_userdata = (int) group().m_userdata_names.size();
-    if (num_userdata) {
+    if (num_userdata && ! use_optix()) {
+        // NB: we don't need these flags in the OptiX case because userdata is
+        //     accessed through rtVariables, which are guaranteed to be initialized
         int sz = (num_userdata + 3) & (~3);  // round up to 32 bits
         ll.op_memset (ll.void_ptr(userdata_initialized_ref(0)), 0, sz, 4 /*align*/);
     }
@@ -726,7 +783,7 @@ BackendLLVM::build_llvm_init ()
     // All done
 #if 0 /* helpful for debugging */
     if (llvm_debug())
-        llvm_gen_debug_printf (Strutil::format("exit group init %s",
+        llvm_gen_debug_printf (Strutil::sprintf("exit group init %s",
                                                group().name());
 #endif
     ll.op_return();
@@ -748,8 +805,7 @@ BackendLLVM::build_llvm_instance (bool groupentry)
 {
     // Make a layer function: void layer_func(ShaderGlobals*, GroupData*)
     // Note that the GroupData* is passed as a void*.
-    std::string unique_layer_name = Strutil::format ("%s_%d", inst()->layername(), inst()->id());
-
+    std::string unique_layer_name = layer_function_name();
     bool is_entry_layer = group().is_entry_layer(layer());
     ll.current_function (
            ll.make_function (unique_layer_name,
@@ -773,7 +829,7 @@ BackendLLVM::build_llvm_instance (bool groupentry)
         // ran. If it has, do an early return. Otherwise, set the 'ran' flag
         // and then run the layer.
         if (shadingsys().llvm_debug_layers())
-            llvm_gen_debug_printf (Strutil::format("checking for already-run layer %d %s %s",
+            llvm_gen_debug_printf (Strutil::sprintf("checking for already-run layer %d %s %s",
                                    this->layer(), inst()->layername(), inst()->shadername()));
         llvm::Value *executed = ll.op_eq (ll.op_load (layerfield), ll.constant_bool(true));
         llvm::BasicBlock *then_block = ll.new_basic_block();
@@ -782,14 +838,14 @@ BackendLLVM::build_llvm_instance (bool groupentry)
         // insert point is now then_block
         // we've already executed, so return early
         if (shadingsys().llvm_debug_layers())
-            llvm_gen_debug_printf (Strutil::format("  taking early exit, already executed layer %d %s %s",
+            llvm_gen_debug_printf (Strutil::sprintf("  taking early exit, already executed layer %d %s %s",
                                    this->layer(), inst()->layername(), inst()->shadername()));
         ll.op_return ();
         ll.set_insert_point (after_block);
     }
 
     if (shadingsys().llvm_debug_layers())
-        llvm_gen_debug_printf (Strutil::format("enter layer %d %s %s",
+        llvm_gen_debug_printf (Strutil::sprintf("enter layer %d %s %s",
                                this->layer(), inst()->layername(), inst()->shadername()));
     // Mark this layer as executed
     if (! group().is_last_layer(layer())) {
@@ -801,7 +857,7 @@ BackendLLVM::build_llvm_instance (bool groupentry)
     // Setup the symbols
     m_named_values.clear ();
     m_layers_already_run.clear ();
-    BOOST_FOREACH (Symbol &s, inst()->symbols()) {
+    for (auto&& s : inst()->symbols()) {
         // Skip constants -- we always inline scalar constants, and for
         // array constants we will just use the pointers to the copy of
         // the constant that belongs to the instance.
@@ -835,7 +891,7 @@ BackendLLVM::build_llvm_instance (bool groupentry)
                      ll.constant(0), ll.constant(ncomps),
                      ll.constant("<none>")
                 };
-                ll.call_function ("osl_naninf_check", args, 10);
+                ll.call_function ("osl_naninf_check", args);
             }
         }
     }
@@ -883,22 +939,66 @@ BackendLLVM::build_llvm_instance (bool groupentry)
     if (llvm_has_exit_instance_block())
         ll.op_branch (m_exit_instance_block); // also sets insert point
 
+    // Track all symbols who needed 'partial' initialization
+    std::unordered_set<Symbol*> initedsyms;
+
     // Transfer all of this layer's outputs into the downstream shader's
     // inputs.
     for (int layer = this->layer()+1;  layer < group().nlayers();  ++layer) {
         ShaderInstance *child = group()[layer];
-        for (int c = 0;  c < child->nconnections();  ++c) {
+        for (int c = 0, Nc = child->nconnections();  c < Nc;  ++c) {
             const Connection &con (child->connection (c));
             if (con.srclayer == this->layer()) {
-                ASSERT (con.src.arrayindex == -1 && con.src.channel == -1 &&
-                        con.dst.arrayindex == -1 && con.dst.channel == -1 &&
-                        "no support for individual element/channel connection");
+                ASSERT (con.src.arrayindex == -1 && con.dst.arrayindex == -1 &&
+                        "no support for individual array element connections");
+                // Validate unsupported connection vecSrc -> vecDst[j]
+                ASSERT ((con.dst.channel == -1 ||
+                         con.src.type.aggregate() == TypeDesc::SCALAR ||
+                         con.src.channel != -1) &&
+                        "no support for vector -> vector[i] connections");
+
                 Symbol *srcsym (inst()->symbol (con.src.param));
                 Symbol *dstsym (child->symbol (con.dst.param));
+
+                // Check remining connections to see if any channels of this
+                // aggregate need to be initialize.
+                if (con.dst.channel != -1 && initedsyms.count(dstsym) == 0) {
+                    initedsyms.insert(dstsym);
+                    std::bitset<32> inited(0); // Only need to be 16 (matrix4)
+                    assert(dstsym->typespec().aggregate() <= inited.size());
+                    unsigned ninit = dstsym->typespec().aggregate() - 1;
+                    for (int rc = c+1;  rc < Nc && ninit;  ++rc) {
+                        const Connection &next (child->connection (rc));
+                        if (next.srclayer == this->layer()) {
+                            // Allow redundant/overwriting connections, i.e:
+                            // 1.  connect layer.value[i] connect layer.value[j]
+                            // 2.  connect layer.value connect layer.value
+                            if (child->symbol (next.dst.param) == dstsym) {
+                                if (next.dst.channel != -1) {
+                                    assert(next.dst.channel < (int)inited.size());
+                                    if (!inited[next.dst.channel]) {
+                                        inited[next.dst.channel] = true;
+                                        --ninit;
+                                    }
+                                } else
+                                    ninit = 0;
+                            }
+                        }
+                    }
+                    if (ninit) {
+                        // FIXME: Init only components that are not connected
+                        llvm_assign_initial_value (*dstsym, true);
+                    }
+                }
+
+                // llvm_run_connected_layers tracks layers that have been run,
+                // so no need to do it here as well
                 llvm_run_connected_layers (*srcsym, con.src.param);
+
                 // FIXME -- I'm not sure I understand this.  Isn't this
                 // unnecessary if we wrote to the parameter ourself?
-                llvm_assign_impl (*dstsym, *srcsym);
+                llvm_assign_impl (*dstsym, *srcsym, -1,
+                                  con.src.channel, con.dst.channel);
             }
         }
     }
@@ -906,7 +1006,7 @@ BackendLLVM::build_llvm_instance (bool groupentry)
 
     // All done
     if (shadingsys().llvm_debug_layers())
-        llvm_gen_debug_printf (Strutil::format("exit layer %d %s %s",
+        llvm_gen_debug_printf (Strutil::sprintf("exit layer %d %s %s",
                                this->layer(), inst()->layername(), inst()->shadername()));
     ll.op_return();
 
@@ -934,11 +1034,14 @@ BackendLLVM::initialize_llvm_group ()
     m_llvm_type_closure_component = NULL;
 
     initialize_llvm_helper_function_map();
-    ll.InstallLazyFunctionCreator (helper_function_lookup);
+
+    // Skipping this in the non-JIT OptiX case suppresses an LLVM warning
+    if (! use_optix())
+        ll.InstallLazyFunctionCreator (helper_function_lookup);
 
     for (HelperFuncMap::iterator i = llvm_helper_function_map.begin(),
          e = llvm_helper_function_map.end(); i != e; ++i) {
-        const char *funcname = i->first.c_str();
+        const std::string &funcname (i->first);
         bool varargs = false;
         const char *types = i->second.argtypes;
         int advance;
@@ -957,7 +1060,15 @@ BackendLLVM::initialize_llvm_group ()
             }
             types += advance;
         }
-        ll.make_function (funcname, false, llvm_type(rettype), params, varargs);
+        if (varargs && use_optix()) {
+            varargs = false;
+            params.push_back (ll.type_void_ptr());
+        }
+        llvm::Function *f = ll.make_function (funcname, false, llvm_type(rettype), params, varargs);
+
+        // Skipping this in the non-JIT OptiX case suppresses an LLVM warning
+        if (! use_optix())
+            ll.add_function_mapping (f, (void *)i->second.function);
     }
 
     // Needed for closure setup
@@ -971,9 +1082,21 @@ BackendLLVM::initialize_llvm_group ()
 
 
 
+static void empty_group_func (void*, void*)
+{
+}
+
+
+
 void
 BackendLLVM::run ()
 {
+    if (group().does_nothing()) {
+        group().llvm_compiled_init ((RunLLVMGroupFunc)empty_group_func);
+        group().llvm_compiled_version ((RunLLVMGroupFunc)empty_group_func);
+        return;
+    }
+
     // At this point, we already hold the lock for this group, by virtue
     // of ShadingSystemImpl::optimize_group.
     OIIO::Timer timer;
@@ -992,16 +1115,27 @@ BackendLLVM::run ()
 #ifdef OSL_LLVM_NO_BITCODE
     ll.module (ll.new_module ("llvm_ops"));
 #else
-    ll.module (ll.module_from_bitcode (osl_llvm_compiled_ops_block,
-                                       osl_llvm_compiled_ops_size,
-                                       "llvm_ops", &err));
+    if (! use_optix()) {
+        ll.module (ll.module_from_bitcode ((char*)osl_llvm_compiled_ops_block,
+                                           osl_llvm_compiled_ops_size,
+                                           "llvm_ops", &err));
+    } else {
+#ifdef OSL_LLVM_CUDA_BITCODE
+        ll.module (ll.module_from_bitcode ((char*)osl_llvm_compiled_ops_cuda_block,
+                                           osl_llvm_compiled_ops_cuda_size,
+                                           "llvm_ops", &err));
+#else
+        ASSERT (0 && "Must generate LLVM CUDA bitcode for OptiX");
+#endif
+    }
     if (err.length())
         shadingcontext()->error ("ParseBitcodeFile returned '%s'\n", err.c_str());
     ASSERT (ll.module());
 #endif
 
-    // Create the ExecutionEngine
-    if (! ll.make_jit_execengine (&err)) {
+    // Create the ExecutionEngine. We don't create an ExecutionEngine in the
+    // OptiX case, because we are using the NVPTX backend and not MCJIT
+    if (! use_optix() && ! ll.make_jit_execengine (&err)) {
         shadingcontext()->error ("Failed to create engine: %s\n", err.c_str());
         ASSERT (0);
         return;
@@ -1077,6 +1211,22 @@ BackendLLVM::run ()
     }
     ll.internalize_module_functions ("osl_", external_function_names, entry_function_names);
 
+    // Debug code to dump the pre-optimized bitcode to a file
+    if (llvm_debug() >= 2 || shadingsys().llvm_output_bitcode()) {
+        // Make a safe group name that doesn't have "/" in it! Also beware
+        // filename length limits.
+        std::string safegroup = Strutil::replace (group().name(), "/", ".", true);
+        if (safegroup.size() > 235)
+            safegroup = Strutil::sprintf ("TRUNC_%s_%d", safegroup.substr(safegroup.size()-235), group().id());
+        std::string name = Strutil::sprintf ("%s.ll", safegroup);
+        std::ofstream out (name, std::ios_base::out | std::ios_base::trunc);
+        if (out.good()) {
+            out << ll.bitcode_string (ll.module());
+        } else {
+            shadingcontext()->error ("Could not write to '%s'", name);
+        }
+    }
+
     // Optimize the LLVM IR unless it's a do-nothing group.
     if (! group().does_nothing())
         ll.do_optimize();
@@ -1090,25 +1240,53 @@ BackendLLVM::run ()
         std::cout.flush();
     }
 
-    // Debug code to dump the resulting bitcode to a file
-    if (llvm_debug() >= 2) {
-        std::string name = Strutil::format ("%s_%d.bc", inst()->layername(),
-                                            inst()->id());
-        ll.write_bitcode_file (name.c_str());
+    // Debug code to dump the post-optimized bitcode to a file
+    if (llvm_debug() >= 2 || shadingsys().llvm_output_bitcode()) {
+        // Make a safe group name that doesn't have "/" in it! Also beware
+        // filename length limits.
+        std::string safegroup = Strutil::replace (group().name(), "/", ".", true);
+        if (safegroup.size() > 235)
+            safegroup = Strutil::sprintf ("TRUNC_%s_%d", safegroup.substr(safegroup.size()-235), group().id());
+        std::string name = Strutil::sprintf ("%s_opt.ll", safegroup);
+        std::ofstream out (name, std::ios_base::out | std::ios_base::trunc);
+        if (out.good()) {
+            out << ll.bitcode_string (ll.module());
+        } else {
+            shadingcontext()->error ("Could not write to '%s'", name);
+        }
     }
 
-    // Force the JIT to happen now and retrieve the JITed function pointers
-    // for the initialization and all public entry points.
-    group().llvm_compiled_init ((RunLLVMGroupFunc) ll.getPointerToFunction(init_func));
-    for (int layer = 0; layer < nlayers; ++layer) {
-        llvm::Function* f = funcs[layer];
-        if (f && group().is_entry_layer (layer))
-            group().llvm_compiled_layer (layer, (RunLLVMGroupFunc) ll.getPointerToFunction(f));
+    if (use_optix()) {
+        // Create an llvm::Module from the renderer-supplied library bitcode
+        std::vector<char>& bitcode = shadingsys().m_lib_bitcode;
+        ASSERT (bitcode.size() && "Library bitcode is empty");
+
+        // TODO: Is it really necessary to build this Module for every ShaderGroup
+        llvm::Module* lib_module =
+            ll.module_from_bitcode (static_cast<const char*>(bitcode.data()),
+                                    bitcode.size(), "cuda_lib");
+
+        std::string name = Strutil::sprintf ("%s_%d", group().name(), group().id());
+        ll.ptx_compile_group (lib_module, name, group().m_llvm_ptx_compiled_version);
+
+        if (group().m_llvm_ptx_compiled_version.empty()) {
+             ASSERT (0 && "Unable to generate PTX");
+        }
     }
-    if (group().num_entry_layers())
-        group().llvm_compiled_version (NULL);
-    else
-        group().llvm_compiled_version (group().llvm_compiled_layer(nlayers-1));
+    else {
+        // Force the JIT to happen now and retrieve the JITed function pointers
+        // for the initialization and all public entry points.
+        group().llvm_compiled_init ((RunLLVMGroupFunc) ll.getPointerToFunction(init_func));
+        for (int layer = 0; layer < nlayers; ++layer) {
+            llvm::Function* f = funcs[layer];
+            if (f && group().is_entry_layer (layer))
+                group().llvm_compiled_layer (layer, (RunLLVMGroupFunc) ll.getPointerToFunction(f));
+        }
+        if (group().num_entry_layers())
+            group().llvm_compiled_version (NULL);
+        else
+            group().llvm_compiled_version (group().llvm_compiled_layer(nlayers-1));
+    }
 
     // Remove the IR for the group layer functions, we've already JITed it
     // and will never need the IR again.  This saves memory, and also saves
